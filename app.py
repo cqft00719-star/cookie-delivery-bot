@@ -76,7 +76,7 @@ def cost_for(shop, boxes):
     return mc, actual
 
 def build_tongxing_matrix():
-    # 橫表：Row1=MIN_CHARGE, Row2=Shop, Row3起=每日實際成本, T欄=日總
+    # 通行：錢。Row1=MIN_CHARGE, Row2=Shop, Row3起=每日實際成本, T欄=日總
     rows = []
     rows.append([""] + MIN_CHARGE + [""])
     rows.append([""] + SHOPS + [""])
@@ -97,13 +97,29 @@ def build_tongxing_matrix():
         rows.append(row)
     return rows
 
-def build_tongxing_excel(path):
-    from openpyxl import Workbook
+def build_zongbiao_matrix():
+    # 運輸總表：箱數。同你新Cap嗰張圖一樣，頭行直接係舖名，唔使MIN_CHARGE行
+    # A欄=日期，B-S=18間舖箱數，T欄=嗰日總箱數
+    rows = []
+    rows.append([""] + SHOPS + ["總箱數"])
+    for d in range(1, 31):
+        ds = f"2026-11-{d:02d}"
+        label = f"{d}-Nov"
+        boxes_map = SCAN_BOXES.get(ds, {})
+        row = [label]
+        day_total = 0
+        for shop in SHOPS:
+            if shop in boxes_map:
+                row.append(boxes_map[shop])
+                day_total += boxes_map[shop]
+            else:
+                row.append("")
+        row.append(day_total if boxes_map else "")
+        rows.append(row)
+    return rows
+
+def style_sheet(ws, matrix, is_cost_sheet):
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "通行"
-    matrix = build_tongxing_matrix()
     fills = {
         "TSTN": "FFFF00", "TSTG": "FFFF00", "TST": "FFFF00",
         "MK": "92D050", "MPMK": "92D050", "MOKO": "92D050", "CENT": "92D050", "HSP": "92D050", "CPE": "92D050", "CWB": "92D050", "CYW": "92D050",
@@ -113,26 +129,38 @@ def build_tongxing_excel(path):
     }
     thin = Side(style="thin", color="B0B0B0")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_row = 2 if is_cost_sheet else 1
     for r_idx, row in enumerate(matrix, start=1):
         for c_idx, val in enumerate(row, start=1):
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
             cell.border = border
             cell.alignment = Alignment(horizontal="center", vertical="center")
-            if r_idx == 1:
+            if r_idx == 1 and is_cost_sheet:
                 cell.font = Font(bold=True)
-            if r_idx == 2 and 2 <= c_idx <= 19:
+            if r_idx == header_row and 2 <= c_idx <= 19:
                 shop = SHOPS[c_idx-2]
                 cell.fill = PatternFill("solid", fgColor=fills.get(shop, "FFFFFF"))
                 cell.font = Font(bold=True)
-            if r_idx >= 3 and c_idx == 1:
+            if r_idx == header_row and c_idx == 20:
                 cell.font = Font(bold=True)
-            if r_idx >= 3 and c_idx == 20 and val != "":
+            if r_idx > header_row and c_idx == 1:
+                cell.font = Font(bold=True)
+            if r_idx > header_row and c_idx == 20 and val != "":
                 cell.font = Font(bold=True)
     ws.column_dimensions['A'].width = 12
     for i in range(2, 20):
         ws.column_dimensions[chr(64+i)].width = 10
     ws.column_dimensions['T'].width = 12
-    ws.freeze_panes = "B3"
+    ws.freeze_panes = "B3" if is_cost_sheet else "B2"
+
+def build_tongxing_excel(path):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "通行"
+    style_sheet(ws1, build_tongxing_matrix(), True)
+    ws2 = wb.create_sheet("運輸總表")
+    style_sheet(ws2, build_zongbiao_matrix(), False)
     wb.save(path)
     return path
 
@@ -201,15 +229,19 @@ async def webhook(req: Request):
             send_evolution_text(TMS_GROUP_ID, "📸 相已收到，但認唔到箱數，請再 Send 一張清啲嘅")
             return {"ok": False, "error": "no boxes"}
         SCAN_BOXES[date_str] = clean
+        # 兩頁一齊寫去 Google Sheet
         sh = get_sheet(SHEET_ID)
-        ws = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
-        ws.clear()
-        ws.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
+        ws1 = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
+        ws1.clear()
+        ws1.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
+        ws2 = get_or_create_ws(sh, "運輸總表", [""]+SHOPS+["總箱數"])
+        ws2.clear()
+        ws2.update('A1', build_zongbiao_matrix(), value_input_option='USER_ENTERED')
         total_today = sum(clean.values())
-        send_evolution_text(TMS_GROUP_ID, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱，已寫入通行")
+        send_evolution_text(TMS_GROUP_ID, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱，已寫入通行 + 運輸總表")
         if MY_WHATSAPP:
             path = get_cumulative_excel_path()
-            send_evolution_media(MY_WHATSAPP, path, f"📋 SCAN 通行累計表 Excel - {date_str} 已更新，今日 {total_today}箱")
+            send_evolution_media(MY_WHATSAPP, path, f"📋 SCAN 累計表 Excel - {date_str} 已更新，今日 {total_today}箱 (通行+運輸總表)")
         return {"ok": True, "date": date_str, "boxes": clean}
     except Exception as e:
         print("webhook error:", e)
@@ -228,11 +260,14 @@ def debug_sheets():
 def rebuild_nov():
     try:
         sh = get_sheet(SHEET_ID)
-        ws = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
-        ws.clear()
-        ws.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
+        ws1 = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
+        ws1.clear()
+        ws1.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
+        ws2 = get_or_create_ws(sh, "運輸總表", [""]+SHOPS+["總箱數"])
+        ws2.clear()
+        ws2.update('A1', build_zongbiao_matrix(), value_input_option='USER_ENTERED')
         total = sum(sum(v.values()) for v in SCAN_BOXES.values())
-        return {"ok": True, "total_boxes_1_15": total, "msg": f"通行已寫入橫表 1-15/11，合計 {total}箱"}
+        return {"ok": True, "total_boxes_1_15": total, "msg": f"通行 + 運輸總表已寫入橫表 1-15/11，合計 {total}箱"}
     except Exception as e:
         print("rebuild-nov error:", e)
         return {"ok": False, "error": str(e)}
@@ -243,7 +278,7 @@ def send_cumulative():
         if not MY_WHATSAPP:
             return {"ok": False, "error": "MY_WHATSAPP 未設定，去 Railway Variables 加返"}
         path = get_cumulative_excel_path()
-        ok = send_evolution_media(MY_WHATSAPP, path, f"📋 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行 (橫表)")
+        ok = send_evolution_media(MY_WHATSAPP, path, f"📋 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行 + 運輸總表")
         return {"ok": ok, "file": os.path.basename(path)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -253,7 +288,7 @@ def nightly_send():
         if not MY_WHATSAPP:
             return {"ok": False, "error": "MY_WHATSAPP 未設定"}
         path = get_cumulative_excel_path()
-        ok = send_evolution_media(MY_WHATSAPP, path, f"今日累計 - 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行")
+        ok = send_evolution_media(MY_WHATSAPP, path, f"今日累計 - 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行 + 運輸總表")
         return {"ok": ok}
     except Exception as e:
         print("nightly error:", e)
