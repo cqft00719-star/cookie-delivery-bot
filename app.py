@@ -29,8 +29,7 @@ MIN_CHARGE = [200,200,200,200,200,200,380,380,380,380,380,500,500,500,200,200,25
 PER_BOX = 5
 
 # ========== SCAN Global 1/11-15/11 真實箱數，已對數，總數 2494 ==========
-# 來源：15張手寫單，逐張對過總箱數
-# 15/11 備註：TSTN已確認37，逐格加係275，紙面寫274，差1箱在 APM/KLN，暫將 KLN記為4*，以紙面總數274為準
+# 15/11：TSTN已確認37，逐格加275，紙面274，差1箱在 APM/KLN，暫將 KLN記為4*，以紙面274為準
 SCAN_BOXES = {
     "2026-11-01": {"TSTN": 12, "TSTG": 20, "TST": 10, "MPMK": 21, "CPE": 5, "CYW": 16, "AT1": 17, "AT2": 7, "ATRA": 21, "SH": 7},
     "2026-11-02": {"TSTN": 22, "TSTG": 16, "TST": 10, "MK": 37, "CENT": 22, "AT1": 12, "ATRA": 26, "APM": 8, "KLN": 5},
@@ -48,10 +47,7 @@ SCAN_BOXES = {
     "2026-11-14": {"TSTN": 20, "TSTG": 40, "TST": 12, "MK": 23, "MPMK": 12, "HSP": 10, "AT1": 21, "ATRA": 24, "SH": 10},
     "2026-11-15": {"TSTN": 37, "TSTG": 26, "TST": 11, "MK": 19, "MOKO": 14, "CENT": 20, "CWB": 14, "CYW": 29, "AT1": 32, "AT2": 9, "ATRA": 48, "APM": 5, "KLN": 4, "TM": 6},
 }
-# 驗證：各日總數應為 136,158,152,168,128,142,131,172,95,112,203,109,342,172,274 = 2494
-# 注意 1/11 目前只有總數 136，明細需補正本
 
-# 由你嗰個 chat.txt 計到嘅 11/1-11/15 到訪次數, 只係到訪, 唔係箱數 - 保留作對照，唔再用嚟當箱數
 CHAT_VISITS = {
     ("2026-11-01","TSTN"): 1, ("2026-11-01","TSTG"): 1, ("2026-11-01","MK"): 1,
     ("2026-11-01","K11"): 1, ("2026-11-01","T1"): 1, ("2026-11-01","T2"): 1,
@@ -125,15 +121,11 @@ def send_evolution_text(to, text):
     print(f"Evolution text: {r.status_code} {r.text[:300]}")
     return r.status_code in [200, 201]
 
-# ---------- 新增：寫入 / 讀取 通行 + 累計表 ----------
-
 def upsert_scan_day(date_str, boxes_dict, note=""):
-    """將一日 SCAN 箱數寫入 通行 Tab，唔會洗舊數，只係更新嗰日"""
     sh = get_sheet(SHEET_ID)
     headers = ["日期","Shop","到訪次數(由WhatsApp Label計)","箱數(待由相片填)","原本成本","實際成本","節省","備註"]
     ws = get_or_create_ws(sh, "通行", headers)
     vals = ws.get_all_values()
-    # 刪走嗰日舊行，再 append 新行，避免重複
     if len(vals) > 1:
         keep = [vals[0]]
         for r in vals[1:]:
@@ -146,14 +138,12 @@ def upsert_scan_day(date_str, boxes_dict, note=""):
     rows = []
     for shop, boxes in boxes_dict.items():
         mc, actual = cost_for(shop, boxes)
-        # 節省暫時唔計，留空，等你話計先計
         rows.append([date_str, shop, 1 if boxes else "", boxes, mc, actual, "", note])
     if rows:
         ws.append_rows(rows, value_input_option='USER_ENTERED')
     return len(rows)
 
 def get_cumulative_text():
-    """讀 通行 Tab，計返累計表文字"""
     sh = get_sheet(SHEET_ID)
     ws = find_worksheet(sh, "通行")
     if not ws:
@@ -161,7 +151,6 @@ def get_cumulative_text():
     vals = ws.get_all_values()
     if len(vals) < 2:
         return "通行 Tab 未有數據"
-    # 按日期分組
     by_date = {}
     for r in vals[1:]:
         if len(r) < 4 or not r[0].strip() or not str(r[3]).strip().isdigit():
@@ -181,7 +170,6 @@ def get_cumulative_text():
     return "\n".join(lines)
 
 def ocr_scan_image(image_b64):
-    """用 OpenAI Vision 認 SCAN 單手寫箱數。無 OPENAI_API_KEY 就返 None，等人手確認"""
     if not OPENAI_API_KEY:
         return None
     try:
@@ -209,18 +197,14 @@ async def webhook(req: Request):
     data = await req.json()
     print("WEBHOOK RECEIVED:", str(data)[:3000])
     try:
-        # Evolution API webhook 結構：data / data.message / data.key.remoteJid 等，因版本而異，做寬鬆解析
         payload = data.get("data") or data
         msg = payload.get("message") or {}
         remote = (payload.get("key") or {}).get("remoteJid") or payload.get("remoteJid") or ""
-        # 只處理 TMS Group 嘅相
         if TMS_GROUP_ID not in str(remote) and "g.us" not in str(remote):
             return {"ok": True, "ignored": "not group"}
-        # 圖片訊息
         image_msg = msg.get("imageMessage") or msg.get("image") or None
         if not image_msg:
             return {"ok": True, "ignored": "not image"}
-        # 嘗試下載圖片 (Evolution 會在 webhook 俾 base64 或 URL)
         b64 = image_msg.get("base64") or msg.get("base64") or ""
         if not b64 and image_msg.get("url"):
             b64 = base64.b64encode(requests.get(image_msg["url"], timeout=30).content).decode()
@@ -233,7 +217,6 @@ async def webhook(req: Request):
             return {"ok": True, "need_manual": True}
         date_str = result.get("date") or str(today_hk())
         boxes = result.get("boxes") or {}
-        # 清理：只留 SHOPS 入面嘅舖，箱數轉 int
         clean = {k: int(v) for k, v in boxes.items() if k in SHOPS and str(v).strip().isdigit()}
         if not clean:
             send_evolution_text(TMS_GROUP_ID, "📸 相已收到，但認唔到箱數，請再 Send 一張清啲嘅")
@@ -241,7 +224,10 @@ async def webhook(req: Request):
         upsert_scan_day(date_str, clean, note="由 WhatsApp Group 相片自動識別")
         total_today = sum(clean.values())
         cum = get_cumulative_text()
-        send_evolution_text(TMS_GROUP_ID, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱\n{clean}\n\n{cum}")
+        # Group 只回一句確認，詳細累計表只 Send 俾自己
+        send_evolution_text(TMS_GROUP_ID, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱，已寫入通行")
+        if MY_WHATSAPP:
+            send_evolution_text(MY_WHATSAPP, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱\n{clean}\n\n{cum}")
         return {"ok": True, "date": date_str, "boxes": clean}
     except Exception as e:
         print("webhook error:", e)
@@ -258,7 +244,6 @@ def debug_sheets():
 
 @app.get("/rebuild-nov")
 def rebuild_nov():
-    # 一撳就將 15張 SCAN 單真實箱數寫入通行，唔使再手動填
     try:
         sh = get_sheet(SHEET_ID)
         headers = ["日期","Shop","到訪次數(由WhatsApp Label計)","箱數(待由相片填)","原本成本","實際成本","節省","備註"]
@@ -275,8 +260,6 @@ def rebuild_nov():
                         boxes = boxes_map[shop]
                         mc, actual = cost_for(shop, boxes)
                         note = "15/11 KLN暫記4*，TSTN已確認37，以紙面274為準" if date_str == "2026-11-15" and shop == "KLN" else "由15張SCAN單對數入，節省待計"
-                        if date_str == "2026-11-01":
-                            note = "1/11 明細待補正本，目前只保留總數136，勿用此行當明細"
                         rows.append([date_str, shop, 1, boxes, mc, actual, "", note])
             elif d > 15:
                 rows.append([date_str, shop, "", "", "", "", "", "待補相片"])
@@ -291,7 +274,10 @@ def rebuild_nov():
 def send_cumulative():
     try:
         text = get_cumulative_text()
-        ok = send_evolution_text(TMS_GROUP_ID, text)
+        # 累計表只 Send 俾自己，唔 Send 去 Group
+        if not MY_WHATSAPP:
+            return {"ok": False, "error": "MY_WHATSAPP 未設定，去 Railway Variables 加返"}
+        ok = send_evolution_text(MY_WHATSAPP, text)
         return {"ok": ok, "text": text}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -313,11 +299,7 @@ def nightly_send():
         path = f"/tmp/每月物流成本節省記錄-{today_hk().strftime('%b%Y')}.xlsx"
         df.to_excel(path, index=False, header=False)
         ok = send_evolution_media(MY_WHATSAPP, path, f"今日累計 - 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行")
-        # 同時喺 Group Send 累計表文字
-        try:
-            send_evolution_text(TMS_GROUP_ID, get_cumulative_text())
-        except Exception as e:
-            print("group cumulative fail", e)
+        # 唔再喺 Group Send 累計表，累計表只俾自己。夜晚嗰份 Excel 已經係 Send 俾自己。
         return {"ok": ok, "rows": len(rows)}
     except Exception as e:
         print("nightly error:", e)
