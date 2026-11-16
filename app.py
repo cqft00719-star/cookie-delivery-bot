@@ -21,12 +21,10 @@ TMS_SHEET_ID = os.environ.get("TMS_SHEET_ID", SHEET_ID)
 MY_WHATSAPP = os.environ.get("MY_WHATSAPP")
 TMS_GROUP_ID = os.environ.get("TMS_GROUP_ID", "120363413020795341@g.us")
 
-# 順序同你張圖一模一樣：TSTN,TSTG,TST,MK,MPMK,MOKO,CENT,HSP,CPE,CWB,CYW,AT1,AT2,ATRA,APM,KLN,TM,SH
 SHOPS = ["TSTN","TSTG","TST","MK","MPMK","MOKO","CENT","HSP","CPE","CWB","CYW","AT1","AT2","ATRA","APM","KLN","TM","SH"]
 MIN_CHARGE = [200,200,200,200,200,200,380,380,380,380,380,500,500,500,200,200,250,250]
 PER_BOX = 5
 
-# SCAN 1/11-15/11 真實箱數，總數 2494，15/11 TSTN已確認37，KLN暫記4*，以紙面274為準
 SCAN_BOXES = {
     "2026-11-01": {"TSTN": 12, "TSTG": 20, "TST": 10, "MPMK": 21, "CPE": 5, "CYW": 16, "AT1": 17, "AT2": 7, "ATRA": 21, "SH": 7},
     "2026-11-02": {"TSTN": 22, "TSTG": 16, "TST": 10, "MK": 37, "CENT": 22, "AT1": 12, "ATRA": 26, "APM": 8, "KLN": 5},
@@ -49,25 +47,36 @@ def get_sheet(sheet_id=SHEET_ID):
     creds = Credentials.from_service_account_info(json.loads(os.environ.get("GCP_JSON")), scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
     gc = gspread.authorize(creds)
     return gc.open_by_key(sheet_id)
+
 def find_worksheet(sh, wanted):
     for ws in sh.worksheets():
-        if ws.title.strip() == wanted.strip(): return ws
+        if ws.title.strip() == wanted.strip():
+            return ws
     return None
+
 def get_or_create_ws(sh, title, headers):
     ws = find_worksheet(sh, title)
-    if ws: return ws
+    if ws:
+        return ws
     ws = sh.add_worksheet(title=title, rows=2000, cols=20)
     ws.update('A1', [headers])
     return ws
+
 def cost_for(shop, boxes):
-    if shop not in SHOPS: return 0, 0
-    idx = SHOPS.index(shop); mc = MIN_CHARGE[idx]; included = mc // PER_BOX
-    if boxes <= included: return mc, mc
-    return mc, mc + (boxes - included) * PER_BOX
+    # $200係基本運費，每箱$5，1-40箱係$200，第41箱起每箱加$5
+    # 其他舖同理：$380包76箱，$500包100箱，$250包50箱
+    if shop not in SHOPS:
+        return 0, 0
+    idx = SHOPS.index(shop)
+    mc = MIN_CHARGE[idx]
+    included = mc // PER_BOX
+    if boxes <= included:
+        return mc, mc
+    actual = mc + (boxes - included) * PER_BOX
+    return mc, actual
 
 def build_tongxing_matrix():
-    # 還原你張圖嘅橫表：Row1=MIN_CHARGE, Row2=Shop, Row3起=每日實際成本, T欄=日總
-    # 回傳 list of lists，A欄=日期，B-S=18間舖，T=日總
+    # 橫表：Row1=MIN_CHARGE, Row2=Shop, Row3起=每日實際成本, T欄=日總
     rows = []
     rows.append([""] + MIN_CHARGE + [""])
     rows.append([""] + SHOPS + [""])
@@ -80,7 +89,8 @@ def build_tongxing_matrix():
         for shop in SHOPS:
             if shop in boxes_map:
                 _, actual = cost_for(shop, boxes_map[shop])
-                row.append(actual); day_total += actual
+                row.append(actual)
+                day_total += actual
             else:
                 row.append("")
         row.append(day_total if boxes_map else "")
@@ -88,12 +98,12 @@ def build_tongxing_matrix():
     return rows
 
 def build_tongxing_excel(path):
-    # 用 openpyxl 寫返你張圖嘅顏色 + 格式，唔用 pandas 咁樣會無顏色
     from openpyxl import Workbook
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-    wb = Workbook(); ws = wb.active; ws.title = "通行"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "通行"
     matrix = build_tongxing_matrix()
-    # 顏色：同你張圖一樣，黃/綠/紅/黃/藍
     fills = {
         "TSTN": "FFFF00", "TSTG": "FFFF00", "TST": "FFFF00",
         "MK": "92D050", "MPMK": "92D050", "MOKO": "92D050", "CENT": "92D050", "HSP": "92D050", "CPE": "92D050", "CWB": "92D050", "CYW": "92D050",
@@ -110,7 +120,7 @@ def build_tongxing_excel(path):
             cell.alignment = Alignment(horizontal="center", vertical="center")
             if r_idx == 1:
                 cell.font = Font(bold=True)
-            if r_idx == 2 and c_idx >= 2 and c_idx <= 19:
+            if r_idx == 2 and 2 <= c_idx <= 19:
                 shop = SHOPS[c_idx-2]
                 cell.fill = PatternFill("solid", fgColor=fills.get(shop, "FFFFFF"))
                 cell.font = Font(bold=True)
@@ -119,18 +129,21 @@ def build_tongxing_excel(path):
             if r_idx >= 3 and c_idx == 20 and val != "":
                 cell.font = Font(bold=True)
     ws.column_dimensions['A'].width = 12
-    for i in range(2, 20): ws.column_dimensions[chr(64+i) if i < 27 else 'A'].width = 10
+    for i in range(2, 20):
+        ws.column_dimensions[chr(64+i)].width = 10
     ws.column_dimensions['T'].width = 12
     ws.freeze_panes = "B3"
     wb.save(path)
     return path
 
 def send_evolution_media(to, file_path, caption):
-    with open(file_path, "rb") as f: b64 = base64.b64encode(f.read()).decode()
+    with open(file_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
     url = f"{EVOLUTION_URL}/message/sendMedia/{quote(INSTANCE)}"
     r = requests.post(url, json={"number": to, "mediatype": "document", "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "caption": caption, "media": b64, "fileName": os.path.basename(file_path)}, headers={"apikey": EVOLUTION_API_KEY}, timeout=60)
     print(f"Evolution send to {to}: {r.status_code} {r.text[:500]}")
     return r.status_code in [200, 201]
+
 def send_evolution_text(to, text):
     url = f"{EVOLUTION_URL}/message/sendText/{quote(INSTANCE)}"
     r = requests.post(url, json={"number": to, "text": text}, headers={"apikey": EVOLUTION_API_KEY}, timeout=20)
@@ -142,7 +155,8 @@ def get_cumulative_excel_path():
     return build_tongxing_excel(path)
 
 def ocr_scan_image(image_b64):
-    if not OPENAI_API_KEY: return None
+    if not OPENAI_API_KEY:
+        return None
     try:
         prompt = """你係物流單據識別員。這是一張 SCAN Global Logistics 手寫送貨單，左邊是舖頭代碼 (TSTN,TSTG,TST, MK,MPMK,MOKO,CENT,HSP,CPE,CWB,CYW,AT1,AT2,ATRA,APM,KLN,TM,SH)，右邊是箱數。請只回傳 JSON，格式：{"date":"2026-11-16","boxes":{"TSTN":12}}，date 是單上日期，若看不清用今天。不要加其他文字。"""
         r = requests.post("https://api.openai.com/v1/chat/completions", json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}]}], "max_tokens": 800}, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=60)
@@ -150,36 +164,47 @@ def ocr_scan_image(image_b64):
         m = re.search(r"\{.*\}", txt, re.S)
         return json.loads(m.group(0)) if m else json.loads(txt)
     except Exception as e:
-        print("OCR fail:", e); return None
+        print("OCR fail:", e)
+        return None
 
 @app.get("/")
-def home(): return {"status": "running", "instance": INSTANCE}
+def home():
+    return {"status": "running", "instance": INSTANCE}
 
 @app.post("/webhook")
 async def webhook(req: Request):
     data = await req.json()
     print("WEBHOOK RECEIVED:", str(data)[:3000])
     try:
-        payload = data.get("data") or data; msg = payload.get("message") or {}
+        payload = data.get("data") or data
+        msg = payload.get("message") or {}
         remote = (payload.get("key") or {}).get("remoteJid") or payload.get("remoteJid") or ""
-        if TMS_GROUP_ID not in str(remote) and "g.us" not in str(remote): return {"ok": True, "ignored": "not group"}
+        if TMS_GROUP_ID not in str(remote) and "g.us" not in str(remote):
+            return {"ok": True, "ignored": "not group"}
         image_msg = msg.get("imageMessage") or msg.get("image") or None
-        if not image_msg: return {"ok": True, "ignored": "not image"}
+        if not image_msg:
+            return {"ok": True, "ignored": "not image"}
         b64 = image_msg.get("base64") or msg.get("base64") or ""
-        if not b64 and image_msg.get("url"): b64 = base64.b64encode(requests.get(image_msg["url"], timeout=30).content).decode()
+        if not b64 and image_msg.get("url"):
+            b64 = base64.b64encode(requests.get(image_msg["url"], timeout=30).content).decode()
         if not b64:
-            send_evolution_text(TMS_GROUP_ID, "📸 收到 SCAN 單相，但下載唔到圖片，請再 Send 一次"); return {"ok": False, "error": "no image data"}
+            send_evolution_text(TMS_GROUP_ID, "📸 收到 SCAN 單相，但下載唔到圖片，請再 Send 一次")
+            return {"ok": False, "error": "no image data"}
         result = ocr_scan_image(b64)
         if not result:
-            send_evolution_text(TMS_GROUP_ID, "📸 收到 SCAN 單相，已存低。未設定 OPENAI_API_KEY 做自動識別，請人手對返數。"); return {"ok": True, "need_manual": True}
-        date_str = result.get("date") or str(today_hk()); boxes = result.get("boxes") or {}
+            send_evolution_text(TMS_GROUP_ID, "📸 收到 SCAN 單相，已存低。未設定 OPENAI_API_KEY 做自動識別，請人手對返數。")
+            return {"ok": True, "need_manual": True}
+        date_str = result.get("date") or str(today_hk())
+        boxes = result.get("boxes") or {}
         clean = {k: int(v) for k, v in boxes.items() if k in SHOPS and str(v).strip().isdigit()}
         if not clean:
-            send_evolution_text(TMS_GROUP_ID, "📸 相已收到，但認唔到箱數，請再 Send 一張清啲嘅"); return {"ok": False, "error": "no boxes"}
+            send_evolution_text(TMS_GROUP_ID, "📸 相已收到，但認唔到箱數，請再 Send 一張清啲嘅")
+            return {"ok": False, "error": "no boxes"}
         SCAN_BOXES[date_str] = clean
-        # 寫返橫表去 Google Sheet
-        sh = get_sheet(SHEET_ID); ws = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
-        ws.clear(); ws.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
+        sh = get_sheet(SHEET_ID)
+        ws = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
+        ws.clear()
+        ws.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
         total_today = sum(clean.values())
         send_evolution_text(TMS_GROUP_ID, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱，已寫入通行")
         if MY_WHATSAPP:
@@ -187,77 +212,103 @@ async def webhook(req: Request):
             send_evolution_media(MY_WHATSAPP, path, f"📋 SCAN 通行累計表 Excel - {date_str} 已更新，今日 {total_today}箱")
         return {"ok": True, "date": date_str, "boxes": clean}
     except Exception as e:
-        print("webhook error:", e); return {"ok": False, "error": str(e)}
+        print("webhook error:", e)
+        return {"ok": False, "error": str(e)}
 
 @app.get("/debug-sheets")
 def debug_sheets():
     try:
-        sh = get_sheet(SHEET_ID); titles = [ws.title for ws in sh.worksheets()]; return {"sheet": sh.title, "worksheets": titles}
-    except Exception as e: return {"ok": False, "error": str(e)}
+        sh = get_sheet(SHEET_ID)
+        titles = [ws.title for ws in sh.worksheets()]
+        return {"sheet": sh.title, "worksheets": titles}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/rebuild-nov")
 def rebuild_nov():
-    # 寫返你張圖嘅橫表去 Google Sheet 通行 Tab
     try:
-        sh = get_sheet(SHEET_ID); ws = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
-        ws.clear(); ws.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
+        sh = get_sheet(SHEET_ID)
+        ws = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
+        ws.clear()
+        ws.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
         total = sum(sum(v.values()) for v in SCAN_BOXES.values())
         return {"ok": True, "total_boxes_1_15": total, "msg": f"通行已寫入橫表 1-15/11，合計 {total}箱"}
     except Exception as e:
-        print("rebuild-nov error:", e); return {"ok": False, "error": str(e)}
+        print("rebuild-nov error:", e)
+        return {"ok": False, "error": str(e)}
 
 @app.get("/send-cumulative")
 def send_cumulative():
-    # 累計表 = Excel file，只 Send 俾自己，唔 Send 文字去 Group
     try:
-        if not MY_WHATSAPP: return {"ok": False, "error": "MY_WHATSAPP 未設定，去 Railway Variables 加返"}
+        if not MY_WHATSAPP:
+            return {"ok": False, "error": "MY_WHATSAPP 未設定，去 Railway Variables 加返"}
         path = get_cumulative_excel_path()
         ok = send_evolution_media(MY_WHATSAPP, path, f"📋 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行 (橫表)")
         return {"ok": ok, "file": os.path.basename(path)}
-    except Exception as e: return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 def nightly_send():
     try:
-        if not MY_WHATSAPP: return {"ok": False, "error": "MY_WHATSAPP 未設定"}
+        if not MY_WHATSAPP:
+            return {"ok": False, "error": "MY_WHATSAPP 未設定"}
         path = get_cumulative_excel_path()
         ok = send_evolution_media(MY_WHATSAPP, path, f"今日累計 - 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行")
         return {"ok": ok}
     except Exception as e:
-        print("nightly error:", e); return {"ok": False, "error": str(e)}
+        print("nightly error:", e)
+        return {"ok": False, "error": str(e)}
 
 def tms_daily_send():
     try:
-        if not TMS_SHEET_ID: return
-        sh = get_sheet(TMS_SHEET_ID); ws = find_worksheet(sh, "Jobs")
-        if not ws: return
+        if not TMS_SHEET_ID:
+            return
+        sh = get_sheet(TMS_SHEET_ID)
+        ws = find_worksheet(sh, "Jobs")
+        if not ws:
+            return
         vals = ws.get_all_values()
         if len(vals) < 2:
-            send_evolution_text(TMS_GROUP_ID, f"📦 TMS每日提醒 {today_hk()} 未來兩日無Order"); return
-        headers = [h.strip() for h in vals[0]]; df = pd.DataFrame(vals[1:], columns=headers)
+            send_evolution_text(TMS_GROUP_ID, f"📦 TMS每日提醒 {today_hk()} 未來兩日無Order")
+            return
+        headers = [h.strip() for h in vals[0]]
+        df = pd.DataFrame(vals[1:], columns=headers)
         date_col = next((c for c in ["Date","送貨日期","DeliveryDate"] if c in df.columns), None)
-        if not date_col: return
+        if not date_col:
+            return
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        today = today_hk(); tomorrow = today + timedelta(days=1); day_after = tomorrow + timedelta(days=1)
+        today = today_hk()
+        tomorrow = today + timedelta(days=1)
+        day_after = tomorrow + timedelta(days=1)
         filtered = df[df[date_col].dt.date.isin([tomorrow, day_after])]
         if filtered.empty:
-            send_evolution_text(TMS_GROUP_ID, f"📦 TMS每日提醒 {today} 聽日 {tomorrow} 同後日 {day_after} 無Order"); _write_tms_log(sh, "OK 無單已發文字"); return
+            send_evolution_text(TMS_GROUP_ID, f"📦 TMS每日提醒 {today} 聽日 {tomorrow} 同後日 {day_after} 無Order")
+            _write_tms_log(sh, "OK 無單已發文字")
+            return
         out_path = f"/tmp/TMS_Orders_{tomorrow}_to_{day_after}.xlsx"
         export_cols = [c for c in ["InternalNo","JobID","Date","Client","Zone","From","To","CargoDetail","DeliveryTime","Notes"] if c in filtered.columns]
         filtered[export_cols].to_excel(out_path, index=False)
         caption = f"📦 TMS每日提醒 {now_hk().strftime('%Y-%m-%d %H:%M HKT')}\n聽日 {tomorrow} 同後日 {day_after} 共有 {len(filtered)} 張單"
-        ok = send_evolution_media(TMS_GROUP_ID, out_path, caption); _write_tms_log(sh, f"{'OK' if ok else 'FAIL'} {len(filtered)}單")
-    except Exception as e: print("tms_daily error:", e)
+        ok = send_evolution_media(TMS_GROUP_ID, out_path, caption)
+        _write_tms_log(sh, f"{'OK' if ok else 'FAIL'} {len(filtered)}單")
+    except Exception as e:
+        print("tms_daily error:", e)
 
 def _write_tms_log(sh, status):
     try:
         ws = get_or_create_ws(sh, "DailyLog", ["Date","Time_HKT","Status","Detail","TriggeredBy"])
         ws.append_row([str(today_hk()), now_hk().strftime("%H:%M:%S"), status, str(now_hk()), "railway-auto"], value_input_option='USER_ENTERED')
-    except Exception as e: print("DailyLog write fail", e)
+    except Exception as e:
+        print("DailyLog write fail", e)
 
 @app.get("/test-tms")
-def test_tms(): tms_daily_send(); return {"ok": True, "msg": "TMS test sent"}
+def test_tms():
+    tms_daily_send()
+    return {"ok": True, "msg": "TMS test sent"}
+
 @app.get("/test-nightly")
-def test_nightly(): return nightly_send()
+def test_nightly():
+    return nightly_send()
 
 scheduler = BackgroundScheduler(timezone="Asia/Hong_Kong")
 scheduler.add_job(nightly_send, "cron", hour=22, minute=0)
