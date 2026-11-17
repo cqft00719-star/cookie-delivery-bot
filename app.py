@@ -19,8 +19,10 @@ BOT_URL = os.getenv("BOT_URL", "https://cookie-delivery-bot-production.up.railwa
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
-app = FastAPI()
+# 曲奇群組 ID - 已經確認係呢個
+ALLOWED_GROUP = "85264352282-1512209129@g.us"
 
+app = FastAPI()
 scan_dates = []
 logs_cache = []
 
@@ -93,15 +95,17 @@ def load_scan_dates():
 @app.on_event("startup")
 def on_startup():
     log("=== cookie-delivery-bot starting ===")
+    log(f"ALLOWED_GROUP={ALLOWED_GROUP}")
     load_scan_dates()
 
-# ================== 主頁 / Health ==================
+# ================== 主頁 ==================
 @app.get("/")
 def root():
     return {
         "status": "running",
         "time": datetime.now().isoformat(),
         "instance": INSTANCE,
+        "allowed_group": ALLOWED_GROUP,
         "scan_dates": scan_dates,
         "webhook_url": f"{BOT_URL}/webhook",
         "recent_logs": logs_cache[-20:]
@@ -131,12 +135,10 @@ def debug_sheets():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ================== 一鍵修 Webhook - 已修正格式 ==================
 @app.get("/fix-webhook")
 def fix_webhook():
     try:
         url = f"{EVOLUTION_URL}/webhook/set/{quote(INSTANCE)}"
-        # Evolution 新版要包一層 webhook: { ... }，唔係直接 Send
         payload = {
             "webhook": {
                 "enabled": True,
@@ -159,7 +161,7 @@ def fix_webhook():
         log(f"FIX-WEBHOOK failed: {e}")
         return {"ok": False, "error": str(e)}
 
-# ================== Webhook 主邏輯 ==================
+# ================== Webhook ==================
 def extract_text(data: dict) -> str:
     try:
         msg = data.get("data", {}).get("message", {}) or data.get("message", {}) or {}
@@ -211,12 +213,14 @@ async def webhook(request: Request):
         is_image = has_image(body)
         log(f"WEBHOOK event={event} remoteJid: {remote_jid} fromMe={from_me} pushName={push_name} text={text[:200]} hasImage={is_image} msgId={msg_id}")
 
-        if from_me:
-            return {"ok": True, "ignored": "fromMe"}
+        # 1. 淨係認呢個曲奇群組，其他群組 / 1對1 唔理，費事俾 MPMK 嗰啲洗版
+        if remote_jid != ALLOWED_GROUP:
+            log(f"WEBHOOK ignored not allowed group remoteJid={remote_jid}")
+            return {"ok": True, "ignored": "not_allowed_group", "remoteJid": remote_jid}
 
-        if not remote_jid:
-            log("WEBHOOK no remoteJid, skip but logged")
-            return {"ok": True, "warn": "no remoteJid"}
+        # 2. 關鍵修正：群組入面 fromMe=True 都要收，因為 John 自己就係個 Bot 帳號
+        # 以前一刀切 ignore fromMe，所以 John 自己 Send 嘅 SGL 相全部漏晒
+        # 而家群組唔理 fromMe，照收
 
         is_sgl = False
         if is_image:
@@ -225,15 +229,15 @@ async def webhook(request: Request):
             is_sgl = True
 
         if is_sgl:
-            log(f"SGL_DETECTED remoteJid={remote_jid} text={text} hasImage={is_image}")
+            log(f"SGL_DETECTED remoteJid={remote_jid} fromMe={from_me} text={text} hasImage={is_image}")
             today = date.today().isoformat()
             if today not in scan_dates:
                 scan_dates.append(today)
                 scan_dates.sort()
         else:
-            log(f"WEBHOOK ignored non-SGL text={text[:100]}")
+            log(f"WEBHOOK ignored non-SGL in allowed group text={text[:100]}")
 
-        return {"ok": True, "remoteJid": remote_jid, "text": text[:100], "hasImage": is_image, "is_sgl": is_sgl}
+        return {"ok": True, "remoteJid": remote_jid, "text": text[:100], "hasImage": is_image, "is_sgl": is_sgl, "fromMe": from_me}
 
     except Exception as e:
         log(f"WEBHOOK error: {e} {traceback.format_exc()}")
