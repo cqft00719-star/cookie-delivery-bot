@@ -1,10 +1,4 @@
-import os
-import re
-import json
-import base64
-import traceback
-import io
-import time
+import os, re, json, base64, traceback, io, time
 from datetime import datetime, timedelta
 from urllib.parse import quote
 import requests
@@ -20,58 +14,48 @@ MY_WHATSAPP = os.getenv("MY_WHATSAPP", "")
 TMS_GROUP_ID = os.getenv("TMS_GROUP_ID", "")
 COOKIE_GROUP_ID = os.getenv("COOKIE_GROUP_ID", "85264352282-1512209129@g.us")
 TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35HmBNNVE")
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-
-ALLOWED_GROUPS = [g for g in [TMS_GROUP_ID, COOKIE_GROUP_ID] if g]
-SHOPS = ["TSTN", "TSTG", "TST", "MK", "MPMK", "MOKO", "CENT", "HSP", "CPE", "CWB", "CYW", "AT1", "AT2", "ATRA", "APM", "KLN", "TM", "SH"]
-
+OCR_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
+ALLOWED = [g for g in [TMS_GROUP_ID, COOKIE_GROUP_ID] if g]
+SHOPS = ["TSTN","TSTG","TST","MK","MPMK","MOKO","CENT","HSP","CPE","CWB","CYW","AT1","AT2","ATRA","APM","KLN","TM","SH"]
 app = FastAPI()
-logs_cache = []
+logs = []
 pending = {}
-recent_photos = {}
+recent = {}
 
 def log(m):
-    print("[" + datetime.now().strftime("%H:%M:%S") + "] " + str(m), flush=True)
-    logs_cache.append(str(m))
-    if len(logs_cache) > 200:
-        logs_cache.pop(0)
+    print(m, flush=True)
+    logs.append(str(m))
+    if len(logs) > 100:
+        logs.pop(0)
 
-def get_gcp_creds():
+def creds():
     from google.oauth2.service_account import Credentials
     s = GCP_JSON.strip()
     if not s.startswith("{"):
         s = base64.b64decode(s).decode()
     info = json.loads(s)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    return Credentials.from_service_account_info(info, scopes=scopes), info
+    return Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
 
-def get_sheet_client():
+def sheet():
     import gspread
-    creds, _ = get_gcp_creds()
-    return gspread.authorize(creds)
+    return gspread.authorize(creds())
 
-def send_text(number, text):
+def send_text(n, t):
     try:
-        url = EVOLUTION_URL + "/message/sendText/" + quote(INSTANCE)
-        requests.post(url, json={"number": number, "text": text}, headers={"apikey": EVOLUTION_API_KEY}, timeout=20)
+        requests.post(EVOLUTION_URL + "/message/sendText/" + quote(INSTANCE), json={"number": n, "text": t}, headers={"apikey": EVOLUTION_API_KEY}, timeout=20)
     except Exception as e:
-        log("SEND fail " + str(e))
+        log(e)
 
-def send_excel_bytes(number, file_bytes, filename, caption):
+def send_xls(n, b, fn, cap):
     try:
-        b64 = base64.b64encode(file_bytes).decode()
-        url = EVOLUTION_URL + "/message/sendMedia/" + quote(INSTANCE)
-        r = requests.post(url, json={"number": number, "mediatype": "document", "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "caption": caption, "media": b64, "fileName": filename}, headers={"apikey": EVOLUTION_API_KEY}, timeout=60)
-        log("SEND_EXCEL " + str(number) + " " + str(r.status_code))
-        return r.status_code in [200, 201]
+        b64 = base64.b64encode(b).decode()
+        requests.post(EVOLUTION_URL + "/message/sendMedia/" + quote(INSTANCE), json={"number": n, "mediatype": "document", "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "caption": cap, "media": b64, "fileName": fn}, headers={"apikey": EVOLUTION_API_KEY}, timeout=60)
     except Exception as e:
-        log("SEND_EXCEL fail " + str(e))
-        return False
+        log(e)
 
-def download_image(data):
+def dl_img(data):
     try:
-        url = EVOLUTION_URL + "/chat/getBase64FromMediaMessage/" + quote(INSTANCE)
-        r = requests.post(url, json={"message": {"key": data.get("key", {}), "message": data.get("message", {})}}, headers={"apikey": EVOLUTION_API_KEY}, timeout=60)
+        r = requests.post(EVOLUTION_URL + "/chat/getBase64FromMediaMessage/" + quote(INSTANCE), json={"message": {"key": data.get("key", {}), "message": data.get("message", {})}}, headers={"apikey": EVOLUTION_API_KEY}, timeout=60)
         j = r.json()
         b64 = j.get("base64") or j.get("data", {}).get("base64") or ""
         if not b64:
@@ -80,102 +64,84 @@ def download_image(data):
             b64 = b64.split(",", 1)[1]
         return base64.b64decode(b64)
     except Exception as e:
-        log("DL fail " + str(e))
+        log(e)
         return None
 
-def ocr_image(img_bytes):
+def ocr(img):
     try:
         from PIL import Image
-        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        im = Image.open(io.BytesIO(img)).convert("RGB")
         im.thumbnail((1200, 1200))
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=75)
-        small = buf.getvalue()
-        r = requests.post("https://api.ocr.space/parse/image", files={"file": ("sgl.jpg", small, "image/jpeg")}, data={"apikey": OCR_SPACE_API_KEY, "language": "eng", "OCREngine": "2", "scale": "true", "isTable": "true"}, timeout=60)
+        r = requests.post("https://api.ocr.space/parse/image", files={"file": ("s.jpg", buf.getvalue(), "image/jpeg")}, data={"apikey": OCR_KEY, "language": "eng", "OCREngine": "2", "scale": "true"}, timeout=60)
         j = r.json()
-        txt = ""
+        t = ""
         try:
-            txt = j["ParsedResults"][0]["ParsedText"]
+            t = j["ParsedResults"][0]["ParsedText"]
         except Exception:
-            txt = ""
-        log("OCR: " + txt[:800])
-        return txt
+            t = ""
+        log("OCR:" + t[:500])
+        return t
     except Exception as e:
-        log("OCR fail " + str(e))
+        log(e)
         return ""
 
-def is_sgl_logistics(txt):
-    if not txt or not txt.strip():
+def is_sgl(t):
+    if not t:
         return False
-    t = txt.upper()
-    if "SGL" in t:
+    u = t.upper()
+    if "SGL" in u:
         return True
-    if "SCAN GLOBAL" in t:
+    if "SCAN GLOBAL" in u:
         return True
-    if "SCAN" in t and "LOGISTICS" in t:
+    if "出貨" in t or "送貨單" in t:
         return True
-    if "出貨" in txt or "送貨單" in txt or "出貨清單" in txt:
-        return True
-    found = [s for s in SHOPS if s in t]
-    nums = re.findall(r"\b\d{1,3}\b", txt)
-    if len(found) >= 3 and len(nums) >= 5:
-        return True
-    return False
+    f = [s for s in SHOPS if s in u]
+    n = re.findall(r"\b\d{1,3}\b", t)
+    return len(f) >= 3 and len(n) >= 5
 
-def parse_sgl_text(txt):
-    m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](202\d)", txt)
-    if m:
-        date_str = str(int(m.group(1))).zfill(2) + "-" + str(int(m.group(2))).zfill(2) + "-" + m.group(3)
-    else:
-        date_str = datetime.now().strftime("%d-%m-%Y")
-    total = 0
-    m2 = re.search(r"總箱數[:：\s]*(\d+)", txt)
-    if m2:
-        total = int(m2.group(1))
-    else:
-        nums = [int(x) for x in re.findall(r"\b(\d{2,3})\b", txt)]
-        if nums:
-            total = max(nums)
+def parse(t):
+    m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](202\d)", t)
+    ds = (str(int(m.group(1))).zfill(2) + "-" + str(int(m.group(2))).zfill(2) + "-" + m.group(3)) if m else datetime.now().strftime("%d-%m-%Y")
+    m2 = re.search(r"總箱數[:：\s]*(\d+)", t)
+    total = int(m2.group(1)) if m2 else 0
+    if not total:
+        ns = [int(x) for x in re.findall(r"\b(\d{2,3})\b", t)]
+        total = max(ns) if ns else 0
     boxes = {}
-    lines = txt.replace(",", " ").splitlines()
-    for shop in SHOPS:
-        boxes[shop] = 0
+    lines = t.replace(",", " ").splitlines()
+    for s in SHOPS:
+        boxes[s] = 0
         for line in lines:
-            if shop in line.upper():
+            if s in line.upper():
                 ns = [int(x) for x in re.findall(r"\b(\d{1,3})\b", line)]
                 if ns:
-                    boxes[shop] = ns[-1]
-    return {"date": date_str, "total": total, "boxes": boxes, "raw": txt}
+                    boxes[s] = ns[-1]
+    return {"date": ds, "total": total, "boxes": boxes}
 
-def write_to_sheet(parsed):
-    gc = get_sheet_client()
-    sh = gc.open_by_key(TMS_SHEET_ID)
+def write_sheet(p):
+    sh = sheet().open_by_key(TMS_SHEET_ID)
     ws = sh.worksheet("運輸總表")
-    dt = datetime.strptime(parsed["date"], "%d-%m-%Y")
-    sheet_date = dt.strftime("%d-%b")
-    values = ws.get_all_values()
-    row_idx = None
-    for i, r in enumerate(values[1:], start=2):
-        if r and r[0].strip() == sheet_date:
-            row_idx = i
+    dt = datetime.strptime(p["date"], "%d-%m-%Y")
+    sd = dt.strftime("%d-%b")
+    vals = ws.get_all_values()
+    ri = None
+    for i, r in enumerate(vals[1:], start=2):
+        if r and r[0].strip() == sd:
+            ri = i
             break
-    if not row_idx:
-        row_idx = len(values) + 1
-        ws.update_cell(row_idx, 1, sheet_date)
-    row_values = [parsed["boxes"].get(s, 0) if parsed["boxes"].get(s, 0) != 0 else "" for s in SHOPS]
-    ws.update("B" + str(row_idx) + ":S" + str(row_idx), [row_values])
-    ws.update_cell(row_idx, 20, parsed["total"])
-    return sheet_date, row_idx
+    if not ri:
+        ri = len(vals) + 1
+        ws.update_cell(ri, 1, sd)
+    rv = [p["boxes"].get(s, 0) if p["boxes"].get(s, 0) != 0 else "" for s in SHOPS]
+    ws.update("B" + str(ri) + ":S" + str(ri), [rv])
+    ws.update_cell(ri, 20, p["total"])
+    return sd, ri
 
-def extract_text(body):
-    msg = body.get("data", {}).get("message", {}) or {}
-    if msg.get("conversation"):
-        return msg["conversation"]
-    if msg.get("extendedTextMessage", {}).get("text"):
-        return msg["extendedTextMessage"]["text"]
-    if msg.get("imageMessage", {}).get("caption"):
-        return msg["imageMessage"]["caption"]
-    return ""
+def ex_text(body):
+    m = body.get("data", {}).get("message", {}) or {}
+    return m.get("conversation") or m.get("extendedTextMessage", {}).get("text") or m.get("imageMessage", {}).get("caption") or ""
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -187,56 +153,74 @@ async def webhook(request: Request):
         if body.get("event") and "upsert" not in str(body.get("event")).lower():
             return {"ok": True}
         data = body.get("data") or {}
-        remote_jid = data.get("key", {}).get("remoteJid") or ""
+        jid = data.get("key", {}).get("remoteJid") or ""
         msg = data.get("message", {}) or {}
-        is_image = bool(msg.get("imageMessage"))
-        text = extract_text(body)
-        if remote_jid not in ALLOWED_GROUPS:
+        if jid not in ALLOWED:
             return {"ok": True}
-        if remote_jid == TMS_GROUP_ID:
+        if jid == TMS_GROUP_ID:
             return {"ok": True}
-        low = text.strip().lower()
-        if low in ["啱", "確認", "ok", "yes", "confirm", "寫入"] and pending:
-            last = list(pending.keys())[-1]
-            parsed = pending[last]
-            sd, row = write_to_sheet(parsed)
-            send_text(remote_jid, "已寫入運輸總表：" + sd + " 第 " + str(row) + " 行，總箱數 " + str(parsed["total"]))
-            if MY_WHATSAPP:
-                send_text(MY_WHATSAPP, "已寫入運輸總表：" + sd + " 總箱數 " + str(parsed["total"]))
+        txt = ex_text(body)
+        low = txt.strip().lower()
+        if low in ["啱", "確認", "ok", "yes", "confirm"] and pending:
+            k = list(pending.keys())[-1]
+            p = pending[k]
+            sd, row = write_sheet(p)
+            send_text(jid, "已寫入 " + sd + " 第" + str(row) + "行 總箱數" + str(p["total"]))
             pending.clear()
             return {"ok": True}
         if low in ["唔啱", "錯", "no"] and pending:
             pending.clear()
-            send_text(remote_jid, "已取消，請重新 Send 一張清楚啲嘅 SGL 單。")
+            send_text(jid, "已取消")
             return {"ok": True}
-        if not is_image:
+        if not msg.get("imageMessage"):
             return {"ok": True}
-        sender = data.get("key", {}).get("participant") or remote_jid
-        now_ts = time.time()
-        lst = [t for t in recent_photos.get(sender, []) if now_ts - t < 30]
+        sender = data.get("key", {}).get("participant") or jid
+        now = time.time()
+        lst = [t for t in recent.get(sender, []) if now - t < 30]
         if len(lst) >= 3:
-            log("SKIP burst " + str(sender))
             return {"ok": True}
-        lst.append(now_ts)
-        recent_photos[sender] = lst
-        img = download_image(data)
+        lst.append(now)
+        recent[sender] = lst
+        img = dl_img(data)
         if not img:
-            log("DL fail silent")
             return {"ok": True}
-        txt = ocr_image(img)
-        if not is_sgl_logistics(txt):
+        t = ocr(img)
+        if not is_sgl(t):
             log("IGNORE not SGL")
             return {"ok": True}
-        parsed = parse_sgl_text(txt)
-        calc = sum(parsed["boxes"].values())
-        log("SGL FOUND " + str(parsed) + " calc=" + str(calc))
-        if calc != parsed["total"]:
-            send_text(remote_jid, "讀到 " + parsed["date"] + "，加埋 " + str(calc) + "，但單上總數 " + str(parsed["total"]) + "，驗算唔啱，唔會自動寫入。")
+        p = parse(t)
+        calc = sum(p["boxes"].values())
+        if calc != p["total"]:
+            send_text(jid, "讀到 " + p["date"] + " 加埋" + str(calc) + " 但總數" + str(p["total"]) + " 唔啱")
             return {"ok": True}
-        pending[parsed["date"]] = parsed
-        box_str = ", ".join([k + ":" + str(v) for k, v in parsed["boxes"].items() if v])
-        send_text(remote_jid, "讀到 " + parsed["date"] + " SGL單：\n" + box_str + "\n總箱數：" + str(parsed["total"]) + "\n\n啱請覆「啱」就會寫入運輸總表，錯請覆「唔啱」。")
+        pending[p["date"]] = p
+        bs = ", ".join([k + ":" + str(v) for k, v in p["boxes"].items() if v])
+        send_text(jid, "讀到 " + p["date"] + " SGL單:\n" + bs + "\n總箱數:" + str(p["total"]) + "\n啱請覆啱")
         return {"ok": True}
     except Exception as e:
         log("ERR " + str(e) + " " + traceback.format_exc())
-        return JSONResponse({"ok": False}, status
+        return JSONResponse({"ok": False}, status_code=200)
+
+def cookie_xls():
+    import openpyxl
+    ws = sheet().open_by_key(TMS_SHEET_ID).worksheet("運輸總表")
+    vals = ws.get_all_values()
+    today = datetime.now().strftime("%d-%b")
+    row = None
+    for r in vals[1:]:
+        if r and r[0].strip() == today:
+            row = r
+            break
+    if not row:
+        return None, today
+    wb = openpyxl.Workbook()
+    w2 = wb.active
+    w2.append(["日期", "舖頭", "箱數"])
+    for s, v in zip(SHOPS, row[1:19]):
+        if v:
+            w2.append([today, s, int(v)])
+    w2.append([today, "總數", row[19] if len(row) > 19 else ""])
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
