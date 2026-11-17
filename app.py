@@ -1,4 +1,4 @@
-import os, io, re, base64, requests, json
+import os, io, re, base64, requests, json, time
 from fastapi import FastAPI, Request
 from datetime import datetime, timedelta, date, timezone
 from urllib.parse import quote
@@ -20,6 +20,7 @@ SHEET_ID = "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35HmBNNVE"
 TMS_SHEET_ID = os.environ.get("TMS_SHEET_ID", SHEET_ID)
 MY_WHATSAPP = os.environ.get("MY_WHATSAPP")
 TMS_GROUP_ID = os.environ.get("TMS_GROUP_ID", "120363413020795341@g.us")
+COOKIE_GROUP_ID = os.environ.get("COOKIE_GROUP_ID", "")
 
 SHOPS = ["TSTN","TSTG","TST","MK","MPMK","MOKO","CENT","HSP","CPE","CWB","CYW","AT1","AT2","ATRA","APM","KLN","TM","SH"]
 MIN_CHARGE = [200,200,200,200,200,200,380,380,380,380,380,500,500,500,200,200,250,250]
@@ -63,8 +64,6 @@ def get_or_create_ws(sh, title, headers):
     return ws
 
 def cost_for(shop, boxes):
-    # $200係基本運費，每箱$5，1-40箱係$200，第41箱起每箱加$5
-    # 其他舖同理：$380包76箱，$500包100箱，$250包50箱
     if shop not in SHOPS:
         return 0, 0
     idx = SHOPS.index(shop)
@@ -76,7 +75,6 @@ def cost_for(shop, boxes):
     return mc, actual
 
 def build_tongxing_matrix():
-    # 通行：錢。Row1=MIN_CHARGE, Row2=Shop, Row3起=每日實際成本, T欄=日總
     rows = []
     rows.append([""] + MIN_CHARGE + [""])
     rows.append([""] + SHOPS + [""])
@@ -98,8 +96,6 @@ def build_tongxing_matrix():
     return rows
 
 def build_zongbiao_matrix():
-    # 運輸總表：箱數。同你新Cap嗰張圖一樣，頭行直接係舖名，唔使MIN_CHARGE行
-    # A欄=日期，B-S=18間舖箱數，T欄=嗰日總箱數
     rows = []
     rows.append([""] + SHOPS + ["總箱數"])
     for d in range(1, 31):
@@ -117,6 +113,53 @@ def build_zongbiao_matrix():
         row.append(day_total if boxes_map else "")
         rows.append(row)
     return rows
+
+def write_both_sheets():
+    sh = get_sheet(SHEET_ID)
+    ws1 = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
+    ws1.clear()
+    time.sleep(1)
+    ws1.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
+    time.sleep(1)
+    ws2 = get_or_create_ws(sh, "運輸總表", [""]+SHOPS+["總箱數"])
+    ws2.clear()
+    time.sleep(1)
+    ws2.update('A1', build_zongbiao_matrix(), value_input_option='USER_ENTERED')
+    time.sleep(1)
+    r1 = len(ws1.get_all_values())
+    r2 = len(ws2.get_all_values())
+    print(f"WRITE DONE 通行 rows: {r1}, 運輸總表 rows: {r2}")
+    return r1, r2
+
+def load_scan_boxes_from_sheet():
+    try:
+        sh = get_sheet(SHEET_ID)
+        ws = find_worksheet(sh, "運輸總表")
+        if not ws:
+            print("No 運輸總表 sheet, skip load")
+            return
+        vals = ws.get_all_values()
+        if len(vals) < 2:
+            print("運輸總表 only header, skip load")
+            return
+        for row in vals[1:]:
+            if not row or not row[0].strip():
+                continue
+            try:
+                day = row[0].split("-")[0].strip()
+                ds = f"2026-11-{int(day):02d}"
+            except:
+                continue
+            boxes = {}
+            for i, shop in enumerate(SHOPS):
+                v = row[i+1].strip() if i+1 < len(row) else ""
+                if v and v.isdigit():
+                    boxes[shop] = int(v)
+            if boxes:
+                SCAN_BOXES[ds] = boxes
+        print(f"Loaded SCAN_BOXES from Sheet: {sorted(SCAN_BOXES.keys())}")
+    except Exception as e:
+        print(f"load from sheet fail: {e}")
 
 def style_sheet(ws, matrix, is_cost_sheet):
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -197,7 +240,7 @@ def ocr_scan_image(image_b64):
 
 @app.get("/")
 def home():
-    return {"status": "running", "instance": INSTANCE}
+    return {"status": "running", "instance": INSTANCE, "scan_dates": sorted(SCAN_BOXES.keys())}
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -207,42 +250,40 @@ async def webhook(req: Request):
         payload = data.get("data") or data
         msg = payload.get("message") or {}
         remote = (payload.get("key") or {}).get("remoteJid") or payload.get("remoteJid") or ""
-        if TMS_GROUP_ID not in str(remote) and "g.us" not in str(remote):
-            return {"ok": True, "ignored": "not group"}
+        print(f"WEBHOOK remoteJid: {remote}")
+        # 認 TMS Group + 曲奇 Group + 任何 g.us 群組，唔好再漏咗曲奇群組 21:07 嗰張相
+        allowed = [TMS_GROUP_ID, COOKIE_GROUP_ID]
+        if remote not in allowed and "g.us" not in str(remote):
+            print(f"IGNORED group: {remote}, allowed: {allowed}")
+            return {"ok": True, "ignored": "not group", "remote": remote}
+        print(f"ACCEPTED group: {remote}")
         image_msg = msg.get("imageMessage") or msg.get("image") or None
         if not image_msg:
-            return {"ok": True, "ignored": "not image"}
+            return {"ok": True, "ignored": "not image", "remote": remote}
         b64 = image_msg.get("base64") or msg.get("base64") or ""
         if not b64 and image_msg.get("url"):
             b64 = base64.b64encode(requests.get(image_msg["url"], timeout=30).content).decode()
         if not b64:
-            send_evolution_text(TMS_GROUP_ID, "📸 收到 SCAN 單相，但下載唔到圖片，請再 Send 一次")
+            send_evolution_text(remote, "📸 收到 SCAN 單相，但下載唔到圖片，請再 Send 一次")
             return {"ok": False, "error": "no image data"}
         result = ocr_scan_image(b64)
         if not result:
-            send_evolution_text(TMS_GROUP_ID, "📸 收到 SCAN 單相，已存低。未設定 OPENAI_API_KEY 做自動識別，請人手對返數。")
+            send_evolution_text(remote, "📸 收到 SCAN 單相，已存低。未設定 OPENAI_API_KEY 做自動識別，請人手對返數。")
             return {"ok": True, "need_manual": True}
         date_str = result.get("date") or str(today_hk())
         boxes = result.get("boxes") or {}
         clean = {k: int(v) for k, v in boxes.items() if k in SHOPS and str(v).strip().isdigit()}
         if not clean:
-            send_evolution_text(TMS_GROUP_ID, "📸 相已收到，但認唔到箱數，請再 Send 一張清啲嘅")
+            send_evolution_text(remote, "📸 相已收到，但認唔到箱數，請再 Send 一張清啲嘅")
             return {"ok": False, "error": "no boxes"}
         SCAN_BOXES[date_str] = clean
-        # 兩頁一齊寫去 Google Sheet
-        sh = get_sheet(SHEET_ID)
-        ws1 = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
-        ws1.clear()
-        ws1.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
-        ws2 = get_or_create_ws(sh, "運輸總表", [""]+SHOPS+["總箱數"])
-        ws2.clear()
-        ws2.update('A1', build_zongbiao_matrix(), value_input_option='USER_ENTERED')
+        r1, r2 = write_both_sheets()
         total_today = sum(clean.values())
-        send_evolution_text(TMS_GROUP_ID, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱，已寫入通行 + 運輸總表")
+        send_evolution_text(remote, f"✅ 已認到 {date_str} SCAN 單：今日 {total_today}箱，已寫入通行 + 運輸總表 (通行{r1}行，總表{r2}行)")
         if MY_WHATSAPP:
             path = get_cumulative_excel_path()
             send_evolution_media(MY_WHATSAPP, path, f"📋 SCAN 累計表 Excel - {date_str} 已更新，今日 {total_today}箱 (通行+運輸總表)")
-        return {"ok": True, "date": date_str, "boxes": clean}
+        return {"ok": True, "date": date_str, "boxes": clean, "tongxing_rows": r1, "zongbiao_rows": r2}
     except Exception as e:
         print("webhook error:", e)
         return {"ok": False, "error": str(e)}
@@ -252,22 +293,18 @@ def debug_sheets():
     try:
         sh = get_sheet(SHEET_ID)
         titles = [ws.title for ws in sh.worksheets()]
-        return {"sheet": sh.title, "worksheets": titles}
+        return {"sheet": sh.title, "worksheets": titles, "scan_dates": sorted(SCAN_BOXES.keys())}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 @app.get("/rebuild-nov")
 def rebuild_nov():
     try:
-        sh = get_sheet(SHEET_ID)
-        ws1 = get_or_create_ws(sh, "通行", [""]+SHOPS+[""])
-        ws1.clear()
-        ws1.update('A1', build_tongxing_matrix(), value_input_option='USER_ENTERED')
-        ws2 = get_or_create_ws(sh, "運輸總表", [""]+SHOPS+["總箱數"])
-        ws2.clear()
-        ws2.update('A1', build_zongbiao_matrix(), value_input_option='USER_ENTERED')
+        # 先由 Sheet 讀返已有嘅數，唔好覆蓋咗 16號之後手動入咗嘅數
+        load_scan_boxes_from_sheet()
+        r1, r2 = write_both_sheets()
         total = sum(sum(v.values()) for v in SCAN_BOXES.values())
-        return {"ok": True, "total_boxes_1_15": total, "msg": f"通行 + 運輸總表已寫入橫表 1-15/11，合計 {total}箱"}
+        return {"ok": True, "total_boxes": total, "tongxing_rows": r1, "zongbiao_rows": r2, "scan_dates": sorted(SCAN_BOXES.keys()), "msg": f"通行 {r1}行，運輸總表 {r2}行，合計 {total}箱"}
     except Exception as e:
         print("rebuild-nov error:", e)
         return {"ok": False, "error": str(e)}
@@ -277,9 +314,10 @@ def send_cumulative():
     try:
         if not MY_WHATSAPP:
             return {"ok": False, "error": "MY_WHATSAPP 未設定，去 Railway Variables 加返"}
+        load_scan_boxes_from_sheet()
         path = get_cumulative_excel_path()
         ok = send_evolution_media(MY_WHATSAPP, path, f"📋 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行 + 運輸總表")
-        return {"ok": ok, "file": os.path.basename(path)}
+        return {"ok": ok, "file": os.path.basename(path), "scan_dates": sorted(SCAN_BOXES.keys())}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -287,6 +325,7 @@ def nightly_send():
     try:
         if not MY_WHATSAPP:
             return {"ok": False, "error": "MY_WHATSAPP 未設定"}
+        load_scan_boxes_from_sheet()
         path = get_cumulative_excel_path()
         ok = send_evolution_media(MY_WHATSAPP, path, f"今日累計 - 每月物流成本節省記錄 {today_hk().strftime('%b%Y')} - 通行 + 運輸總表")
         return {"ok": ok}
@@ -344,6 +383,12 @@ def test_tms():
 @app.get("/test-nightly")
 def test_nightly():
     return nightly_send()
+
+# 開機先讀返 Sheet，唔好淨係靠硬編碼 1-15號
+try:
+    load_scan_boxes_from_sheet()
+except Exception as e:
+    print(f"startup load fail: {e}")
 
 scheduler = BackgroundScheduler(timezone="Asia/Hong_Kong")
 scheduler.add_job(nightly_send, "cron", hour=22, minute=0)
