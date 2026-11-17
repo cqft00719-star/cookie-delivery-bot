@@ -1,11 +1,16 @@
-import os, re, json, base64, traceback, io, time
+import os
+import re
+import json
+import base64
+import traceback
+import io
+import time
 from datetime import datetime, timedelta
 from urllib.parse import quote
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# ============ 1. Railway Variables ============
 EVOLUTION_URL = "https://evolution-api-production-5d91de27.up.railway.app"
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 INSTANCE = "my WhatsApps"
@@ -18,27 +23,26 @@ TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35H
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
 
 ALLOWED_GROUPS = [g for g in [TMS_GROUP_ID, COOKIE_GROUP_ID] if g]
-SHOPS = ["TSTN","TSTG","TST","MK","MPMK","MOKO","CENT","HSP","CPE","CWB","CYW","AT1","AT2","ATRA","APM","KLN","TM","SH"]
+SHOPS = ["TSTN", "TSTG", "TST", "MK", "MPMK", "MOKO", "CENT", "HSP", "CPE", "CWB", "CYW", "AT1", "AT2", "ATRA", "APM", "KLN", "TM", "SH"]
 
 app = FastAPI()
 logs_cache = []
 pending = {}
-recent_photos = {}  # 防洗版
+recent_photos = {}
 
 def log(m):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
-    logs_cache.append(m)
+    print("[" + datetime.now().strftime("%H:%M:%S") + "] " + str(m), flush=True)
+    logs_cache.append(str(m))
     if len(logs_cache) > 200:
         logs_cache.pop(0)
 
-# ============ 2. GCP / Sheet (只係用嚟寫 Sheet，唔再用嚟 OCR) ============
 def get_gcp_creds():
     from google.oauth2.service_account import Credentials
     s = GCP_JSON.strip()
     if not s.startswith("{"):
         s = base64.b64decode(s).decode()
     info = json.loads(s)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     return Credentials.from_service_account_info(info, scopes=scopes), info
 
 def get_sheet_client():
@@ -46,29 +50,27 @@ def get_sheet_client():
     creds, _ = get_gcp_creds()
     return gspread.authorize(creds)
 
-# ============ 3. WhatsApp 發送 ============
 def send_text(number, text):
     try:
-        url = f"{EVOLUTION_URL}/message/sendText/{quote(INSTANCE)}"
+        url = EVOLUTION_URL + "/message/sendText/" + quote(INSTANCE)
         requests.post(url, json={"number": number, "text": text}, headers={"apikey": EVOLUTION_API_KEY}, timeout=20)
     except Exception as e:
-        log(f"SEND fail {e}")
+        log("SEND fail " + str(e))
 
 def send_excel_bytes(number, file_bytes, filename, caption):
     try:
         b64 = base64.b64encode(file_bytes).decode()
-        url = f"{EVOLUTION_URL}/message/sendMedia/{quote(INSTANCE)}"
+        url = EVOLUTION_URL + "/message/sendMedia/" + quote(INSTANCE)
         r = requests.post(url, json={"number": number, "mediatype": "document", "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "caption": caption, "media": b64, "fileName": filename}, headers={"apikey": EVOLUTION_API_KEY}, timeout=60)
-        log(f"SEND_EXCEL {number} {r.status_code}")
+        log("SEND_EXCEL " + str(number) + " " + str(r.status_code))
         return r.status_code in [200, 201]
     except Exception as e:
-        log(f"SEND_EXCEL fail {e}")
+        log("SEND_EXCEL fail " + str(e))
         return False
 
-# ============ 4. 下載相 ============
 def download_image(data):
     try:
-        url = f"{EVOLUTION_URL}/chat/getBase64FromMediaMessage/{quote(INSTANCE)}"
+        url = EVOLUTION_URL + "/chat/getBase64FromMediaMessage/" + quote(INSTANCE)
         r = requests.post(url, json={"message": {"key": data.get("key", {}), "message": data.get("message", {})}}, headers={"apikey": EVOLUTION_API_KEY}, timeout=60)
         j = r.json()
         b64 = j.get("base64") or j.get("data", {}).get("base64") or ""
@@ -78,60 +80,30 @@ def download_image(data):
             b64 = b64.split(",", 1)[1]
         return base64.b64decode(b64)
     except Exception as e:
-        log(f"DL fail {e}")
+        log("DL fail " + str(e))
         return None
 
-# ============ 5. OCR - 唔用 Google Vision，轉用 OCR.space，唔使 GCP 權限 ============
-def ocr_with_gcp_vision(img_bytes):
+def ocr_image(img_bytes):
     try:
-        # 先壓細張相，OCR.space 免費版先食得落
         from PIL import Image
-        import io as _io
-        im = Image.open(_io.BytesIO(img_bytes)).convert("RGB")
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         im.thumbnail((1200, 1200))
-        buf = _io.BytesIO()
+        buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=75)
         small = buf.getvalue()
-        r = requests.post(
-            "https://api.ocr.space/parse/image",
-            files={"file": ("sgl.jpg", small, "image/jpeg")},
-            data={"apikey": OCR_SPACE_API_KEY, "language": "eng", "OCREngine": "2", "scale": "true", "isTable": "true"},
-            timeout=60
-        )
+        r = requests.post("https://api.ocr.space/parse/image", files={"file": ("sgl.jpg", small, "image/jpeg")}, data={"apikey": OCR_SPACE_API_KEY, "language": "eng", "OCREngine": "2", "scale": "true", "isTable": "true"}, timeout=60)
         j = r.json()
         txt = ""
         try:
             txt = j["ParsedResults"][0]["ParsedText"]
-        except:
+        except Exception:
             txt = ""
-        log(f"OCR.space: {txt[:1000]}")
-        # OCR.space 讀到就返，讀唔到先試 Vision 做後備，失敗都唔出聲
-        if txt.strip():
-            return txt
-        log("OCR.space empty, try Vision fallback")
-        try:
-            from google.cloud import vision
-            creds, _ = get_gcp_creds()
-            # Vision 要 cloud-vision scope，上面 get_gcp_creds 冇加，呢度直接加
-            from google.oauth2.service_account import Credentials
-            s = GCP_JSON.strip()
-            if not s.startswith("{"):
-                s = base64.b64decode(s).decode()
-            info = json.loads(s)
-            creds2 = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/cloud-vision"])
-            client = vision.ImageAnnotatorClient(credentials=creds2)
-            image = vision.Image(content=img_bytes)
-            resp = client.document_text_detection(image=image)
-            txt2 = resp.full_text_annotation.text if resp.full_text_annotation else ""
-            return txt2
-        except Exception as e2:
-            log(f"Vision fallback fail {e2} - 唔使理，已經唔靠佢")
-            return ""
+        log("OCR: " + txt[:800])
+        return txt
     except Exception as e:
-        log(f"OCR fail {e}")
+        log("OCR fail " + str(e))
         return ""
 
-# ============ 6. 自己認係咪 SGL Logistics ============
 def is_sgl_logistics(txt):
     if not txt or not txt.strip():
         return False
@@ -144,34 +116,127 @@ def is_sgl_logistics(txt):
         return True
     if "出貨" in txt or "送貨單" in txt or "出貨清單" in txt:
         return True
-    # 冇 SGL 字，但有 3 間以上舖名 + 有數字，99% 係 SGL 單
-    found_shops = [s for s in SHOPS if s in t]
+    found = [s for s in SHOPS if s in t]
     nums = re.findall(r"\b\d{1,3}\b", txt)
-    if len(found_shops) >= 3 and len(nums) >= 5:
+    if len(found) >= 3 and len(nums) >= 5:
         return True
     return False
 
 def parse_sgl_text(txt):
     m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](202\d)", txt)
-    date_str = f"{int(m.group(1)):02d}-{int(m.group(2)):02d}-{m.group(3)}" if m else datetime.now().strftime("%d-%m-%Y")
-    nums = [int(x) for x in re.findall(r"\b(\d{2,3})\b", txt)]a(days=1)
-    filtered = []
-    for r in values[1:]:
-        try: d = datetime.strptime(r[date_idx].split(" ")[0], "%Y-%m-%d").date()
-        except:
-            try: d = datetime.strptime(r[date_idx].split(" ")[0], "%d-%m-%Y").date()
-            except: continue
-        if d in [tomorrow, day_after]: filtered.append(r)
-    if not filtered: return None, f"{tomorrow}~{day_after} 無單"
-    wb = openpyxl.Workbook(); ws2 = wb.active; ws2.title = "TMS Orders"
-    idxs = [i for i,h in enumerate(headers) if h in ["InternalNo","JobID","Date","Client","Zone","From","To","CargoDetail","DeliveryTime","Notes"]]
-    ws2.append([headers[i] for i in idxs])
-    for r in filtered: ws2.append([r[i] if i < len(r) else "" for i in idxs])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return bio.getvalue(), f"{tomorrow} to {day_after} 共 {len(filtered)} 單"
+    if m:
+        date_str = str(int(m.group(1))).zfill(2) + "-" + str(int(m.group(2))).zfill(2) + "-" + m.group(3)
+    else:
+        date_str = datetime.now().strftime("%d-%m-%Y")
+    total = 0
+    m2 = re.search(r"總箱數[:：\s]*(\d+)", txt)
+    if m2:
+        total = int(m2.group(1))
+    else:
+        nums = [int(x) for x in re.findall(r"\b(\d{2,3})\b", txt)]
+        if nums:
+            total = max(nums)
+    boxes = {}
+    lines = txt.replace(",", " ").splitlines()
+    for shop in SHOPS:
+        boxes[shop] = 0
+        for line in lines:
+            if shop in line.upper():
+                ns = [int(x) for x in re.findall(r"\b(\d{1,3})\b", line)]
+                if ns:
+                    boxes[shop] = ns[-1]
+    return {"date": date_str, "total": total, "boxes": boxes, "raw": txt}
 
-def send_daily_17_vip():
-    if not TMS_GROUP_ID: return
-    b, info = make_tms_daily_excel()
-    if not b: send_text(TMS_GROUP_ID, f"📦 TMS每日提醒 {datetime.now().strftime('%Y-%m-%d')} {info}")
-   
+def write_to_sheet(parsed):
+    gc = get_sheet_client()
+    sh = gc.open_by_key(TMS_SHEET_ID)
+    ws = sh.worksheet("運輸總表")
+    dt = datetime.strptime(parsed["date"], "%d-%m-%Y")
+    sheet_date = dt.strftime("%d-%b")
+    values = ws.get_all_values()
+    row_idx = None
+    for i, r in enumerate(values[1:], start=2):
+        if r and r[0].strip() == sheet_date:
+            row_idx = i
+            break
+    if not row_idx:
+        row_idx = len(values) + 1
+        ws.update_cell(row_idx, 1, sheet_date)
+    row_values = [parsed["boxes"].get(s, 0) if parsed["boxes"].get(s, 0) != 0 else "" for s in SHOPS]
+    ws.update("B" + str(row_idx) + ":S" + str(row_idx), [row_values])
+    ws.update_cell(row_idx, 20, parsed["total"])
+    return sheet_date, row_idx
+
+def extract_text(body):
+    msg = body.get("data", {}).get("message", {}) or {}
+    if msg.get("conversation"):
+        return msg["conversation"]
+    if msg.get("extendedTextMessage", {}).get("text"):
+        return msg["extendedTextMessage"]["text"]
+    if msg.get("imageMessage", {}).get("caption"):
+        return msg["imageMessage"]["caption"]
+    return ""
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        if body.get("event") and "upsert" not in str(body.get("event")).lower():
+            return {"ok": True}
+        data = body.get("data") or {}
+        remote_jid = data.get("key", {}).get("remoteJid") or ""
+        msg = data.get("message", {}) or {}
+        is_image = bool(msg.get("imageMessage"))
+        text = extract_text(body)
+        if remote_jid not in ALLOWED_GROUPS:
+            return {"ok": True}
+        if remote_jid == TMS_GROUP_ID:
+            return {"ok": True}
+        low = text.strip().lower()
+        if low in ["啱", "確認", "ok", "yes", "confirm", "寫入"] and pending:
+            last = list(pending.keys())[-1]
+            parsed = pending[last]
+            sd, row = write_to_sheet(parsed)
+            send_text(remote_jid, "已寫入運輸總表：" + sd + " 第 " + str(row) + " 行，總箱數 " + str(parsed["total"]))
+            if MY_WHATSAPP:
+                send_text(MY_WHATSAPP, "已寫入運輸總表：" + sd + " 總箱數 " + str(parsed["total"]))
+            pending.clear()
+            return {"ok": True}
+        if low in ["唔啱", "錯", "no"] and pending:
+            pending.clear()
+            send_text(remote_jid, "已取消，請重新 Send 一張清楚啲嘅 SGL 單。")
+            return {"ok": True}
+        if not is_image:
+            return {"ok": True}
+        sender = data.get("key", {}).get("participant") or remote_jid
+        now_ts = time.time()
+        lst = [t for t in recent_photos.get(sender, []) if now_ts - t < 30]
+        if len(lst) >= 3:
+            log("SKIP burst " + str(sender))
+            return {"ok": True}
+        lst.append(now_ts)
+        recent_photos[sender] = lst
+        img = download_image(data)
+        if not img:
+            log("DL fail silent")
+            return {"ok": True}
+        txt = ocr_image(img)
+        if not is_sgl_logistics(txt):
+            log("IGNORE not SGL")
+            return {"ok": True}
+        parsed = parse_sgl_text(txt)
+        calc = sum(parsed["boxes"].values())
+        log("SGL FOUND " + str(parsed) + " calc=" + str(calc))
+        if calc != parsed["total"]:
+            send_text(remote_jid, "讀到 " + parsed["date"] + "，加埋 " + str(calc) + "，但單上總數 " + str(parsed["total"]) + "，驗算唔啱，唔會自動寫入。")
+            return {"ok": True}
+        pending[parsed["date"]] = parsed
+        box_str = ", ".join([k + ":" + str(v) for k, v in parsed["boxes"].items() if v])
+        send_text(remote_jid, "讀到 " + parsed["date"] + " SGL單：\n" + box_str + "\n總箱數：" + str(parsed["total"]) + "\n\n啱請覆「啱」就會寫入運輸總表，錯請覆「唔啱」。")
+        return {"ok": True}
+    except Exception as e:
+        log("ERR " + str(e) + " " + traceback.format_exc())
+        return JSONResponse({"ok": False}, status
