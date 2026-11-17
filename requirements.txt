@@ -1,10 +1,8 @@
 fastapi
 uvicorn
-gspread
-google-auth
-pandas
-openpyxl
 requests
-Pillow
-pytesseract
+gspread
+google-cloud-vision
+google-auth
+openpyxl
 apscheduler
