@@ -69,20 +69,33 @@ def dl_img(data):
 
 def ocr(img):
     try:
-        from PIL import Image
-        im = Image.open(io.BytesIO(img)).convert("RGB")
-        im.thumbnail((1200, 1200))
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=75)
-        r = requests.post("https://api.ocr.space/parse/image", files={"file": ("s.jpg", buf.getvalue(), "image/jpeg")}, data={"apikey": OCR_KEY, "language": "eng", "OCREngine": "2", "scale": "true"}, timeout=60)
-        j = r.json()
-        t = ""
+        data = img
         try:
-            t = j["ParsedResults"][0]["ParsedText"]
-        except Exception:
-            t = ""
-        log("OCR:" + t[:500])
-        return t
+            from PIL import Image
+            im = Image.open(io.BytesIO(img)).convert("RGB")
+            im.thumbnail((1200, 1200))
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=75)
+            data = buf.getvalue()
+        except Exception as e:
+            log("PIL skip " + str(e))
+        for eng in ["2", "1"]:
+            try:
+                r = requests.post("https://api.ocr.space/parse/image", files={"file": ("s.jpg", data, "image/jpeg")}, data={"apikey": OCR_KEY, "language": "eng", "OCREngine": eng, "scale": "true"}, timeout=60)
+                j = r.json()
+                log("OCR raw " + str(j)[:500])
+                t = ""
+                try:
+                    t = j["ParsedResults"][0]["ParsedText"]
+                except Exception:
+                    t = ""
+                if t and t.strip():
+                    log("OCR:" + t[:800])
+                    return t
+                log("OCR empty engine " + eng + " err " + str(j.get("ErrorMessage")))
+            except Exception as e:
+                log("OCR engine " + eng + " fail " + str(e))
+        return ""
     except Exception as e:
         log(e)
         return ""
@@ -93,7 +106,11 @@ def is_sgl(t):
     u = t.upper()
     if "SGL" in u:
         return True
-    if "SCAN GLOBAL" in u:
+    if "SCAN" in u:
+        return True
+    if "GLOBAL" in u and "LOGISTICS" in u:
+        return True
+    if "LOGISTICS" in u:
         return True
     if "出貨" in t or "送貨單" in t:
         return True
@@ -149,78 +166,4 @@ async def webhook(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    try:
-        if body.get("event") and "upsert" not in str(body.get("event")).lower():
-            return {"ok": True}
-        data = body.get("data") or {}
-        jid = data.get("key", {}).get("remoteJid") or ""
-        msg = data.get("message", {}) or {}
-        if jid not in ALLOWED:
-            return {"ok": True}
-        if jid == TMS_GROUP_ID:
-            return {"ok": True}
-        txt = ex_text(body)
-        low = txt.strip().lower()
-        if low in ["啱", "確認", "ok", "yes", "confirm"] and pending:
-            k = list(pending.keys())[-1]
-            p = pending[k]
-            sd, row = write_sheet(p)
-            send_text(jid, "已寫入 " + sd + " 第" + str(row) + "行 總箱數" + str(p["total"]))
-            pending.clear()
-            return {"ok": True}
-        if low in ["唔啱", "錯", "no"] and pending:
-            pending.clear()
-            send_text(jid, "已取消")
-            return {"ok": True}
-        if not msg.get("imageMessage"):
-            return {"ok": True}
-        sender = data.get("key", {}).get("participant") or jid
-        now = time.time()
-        lst = [t for t in recent.get(sender, []) if now - t < 30]
-        if len(lst) >= 3:
-            return {"ok": True}
-        lst.append(now)
-        recent[sender] = lst
-        img = dl_img(data)
-        if not img:
-            return {"ok": True}
-        t = ocr(img)
-        if not is_sgl(t):
-            log("IGNORE not SGL")
-            return {"ok": True}
-        p = parse(t)
-        calc = sum(p["boxes"].values())
-        if calc != p["total"]:
-            send_text(jid, "讀到 " + p["date"] + " 加埋" + str(calc) + " 但總數" + str(p["total"]) + " 唔啱")
-            return {"ok": True}
-        pending[p["date"]] = p
-        bs = ", ".join([k + ":" + str(v) for k, v in p["boxes"].items() if v])
-        send_text(jid, "讀到 " + p["date"] + " SGL單:\n" + bs + "\n總箱數:" + str(p["total"]) + "\n啱請覆啱")
-        return {"ok": True}
-    except Exception as e:
-        log("ERR " + str(e) + " " + traceback.format_exc())
-        return JSONResponse({"ok": False}, status_code=200)
-
-def cookie_xls():
-    import openpyxl
-    ws = sheet().open_by_key(TMS_SHEET_ID).worksheet("運輸總表")
-    vals = ws.get_all_values()
-    today = datetime.now().strftime("%d-%b")
-    row = None
-    for r in vals[1:]:
-        if r and r[0].strip() == today:
-            row = r
-            break
-    if not row:
-        return None, today
-    wb = openpyxl.Workbook()
-    w2 = wb.active
-    w2.append(["日期", "舖頭", "箱數"])
-    for s, v in zip(SHOPS, row[1:19]):
-        if v:
-            w2.append([today, s, int(v)])
-    w2.append([today, "總數", row[19] if len(row) > 19 else ""])
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio
+   
