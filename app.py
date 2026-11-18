@@ -25,6 +25,25 @@ OCR_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
 SHOPS = ["TSTN", "TSTG", "TST", "MK", "MPMK", "MOKO"]
 SHOPS = SHOPS + ["CENT", "HSP", "CPE", "CWB", "CYW", "AT1"]
 SHOPS = SHOPS + ["AT2", "ATRA", "APM", "KLN", "TM", "SH"]
+FEES = {}
+FEES["TSTN"] = 200
+FEES["TSTG"] = 200
+FEES["TST"] = 200
+FEES["MK"] = 200
+FEES["MPMK"] = 200
+FEES["MOKO"] = 200
+FEES["CENT"] = 380
+FEES["HSP"] = 380
+FEES["CPE"] = 380
+FEES["CWB"] = 380
+FEES["CYW"] = 380
+FEES["AT1"] = 500
+FEES["AT2"] = 500
+FEES["ATRA"] = 500
+FEES["APM"] = 200
+FEES["KLN"] = 200
+FEES["TM"] = 250
+FEES["SH"] = 250
 app = FastAPI()
 logs = []
 cookie_photos = []
@@ -200,20 +219,29 @@ def parse(t):
     out["raw"] = t
     return out
 
-def write_sheet(p):
+def yellow(ws, ri, cols):
+    try:
+        for c in cols:
+            col = chr(64 + c)
+            cell = col + str(ri)
+            ws.format(cell, {"backgroundColor": {"red": 1, "green": 1, "blue": 0}})
+    except Exception as e:
+        log("yellow fail " + str(e))
+
+def write_both(p, hl):
     sh = sheet().open_by_key(TMS_SHEET_ID)
-    ws = sh.worksheet("運輸總表")
     dt = datetime.strptime(p["date"], "%d-%m-%Y")
     sd = dt.strftime("%d-%b")
-    vals = ws.get_all_values()
+    ws1 = sh.worksheet("運輸總表")
+    vals1 = ws1.get_all_values()
     ri = None
-    for i, r in enumerate(vals[1:], start=2):
+    for i, r in enumerate(vals1[1:], start=2):
         if r and r[0].strip() == sd:
             ri = i
             break
     if not ri:
-        ri = len(vals) + 1
-        ws.update_cell(ri, 1, sd)
+        ri = len(vals1) + 1
+        ws1.update_cell(ri, 1, sd)
     rv = []
     for s in SHOPS:
         v = p["boxes"].get(s, 0)
@@ -221,9 +249,53 @@ def write_sheet(p):
             rv.append("")
         else:
             rv.append(v)
-    ws.update("B" + str(ri) + ":S" + str(ri), [rv])
-    ws.update_cell(ri, 20, p["total"])
-    return sd, ri
+    ws1.update("B" + str(ri) + ":S" + str(ri), [rv])
+    ws1.update_cell(ri, 20, p["total"])
+    ws2 = sh.worksheet("通行")
+    vals2 = ws2.get_all_values()
+    ri2 = None
+    for i, r in enumerate(vals2[1:], start=2):
+        if r and r[0].strip() == sd:
+            ri2 = i
+            break
+    if not ri2:
+        ri2 = len(vals2) + 1
+        ws2.update_cell(ri2, 1, sd)
+    rv2 = []
+    fee_total = 0
+    for s in SHOPS:
+        v = p["boxes"].get(s, 0)
+        if v == 0:
+            rv2.append("")
+        else:
+            f = FEES.get(s, 0)
+            rv2.append(f)
+            fee_total = fee_total + f
+    ws2.update("B" + str(ri2) + ":S" + str(ri2), [rv2])
+    ws2.update_cell(ri2, 20, fee_total)
+    if hl:
+        cols1 = []
+        for idx, s in enumerate(SHOPS, start=2):
+            if p["boxes"].get(s, 0) > 0:
+                cols1.append(idx)
+        yellow(ws1, ri, cols1)
+        yellow(ws1, ri, [20])
+        yellow(ws2, ri2, cols1)
+        yellow(ws2, ri2, [20])
+    return sd, ri, fee_total
+
+def wa_text(p, sd, fee_total):
+    lines = []
+    lines.append(p["date"] + " 曲奇送貨已寫入")
+    for s in SHOPS:
+        v = p["boxes"].get(s, 0)
+        if v:
+            lines.append(s + " " + str(v))
+    lines.append("總箱數：" + str(p["total"]))
+    lines.append("通行總數：$" + str(fee_total))
+    lines.append("已寫入 運輸總表 + 通行 " + sd)
+    lines.append("黃色格 = OCR 估嘅，請喺 Sheet 對一次")
+    return "\n".join(lines)
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -238,9 +310,9 @@ async def webhook(request: Request):
         data = body.get("data") or {}
         key = data.get("key", {})
         jid = key.get("remoteJid") or ""
-        msg = data.get("message", {}) or {}
         if jid != COOKIE_GROUP_ID:
             return {"ok": True}
+        msg = data.get("message", {}) or {}
         if not msg.get("imageMessage"):
             return {"ok": True}
         img = dl_img(data)
@@ -404,26 +476,9 @@ def send22():
         cookie_photos.clear()
         return
     p = parse(t)
-    calc = sum(p["boxes"].values())
-    warn = ""
-    if calc != p["total"]:
-        warn = "\n驗算唔啱：加埋=" + str(calc)
-        warn = warn + "，單上總數=" + str(p["total"])
-        warn = warn + "，已照單上總數寫入。"
     try:
-        sd, row = write_sheet(p)
-        b = cookie_xls(p)
-        parts = []
-        for k, v in p["boxes"].items():
-            if v:
-                parts.append(k + ":" + str(v))
-        bs = ", ".join(parts)
-        cap = p["date"] + " 曲奇送貨總結\n" + bs
-        cap = cap + "\n總箱數:" + str(p["total"])
-        cap = cap + "\n已寫入運輸總表 " + sd
-        cap = cap + " 第" + str(row) + "行" + warn
-        fn = "cookie-" + p["date"] + ".xlsx"
-        send_xls(MY_WHATSAPP, b, fn, cap)
+        sd, row, fee_total = write_both(p, True)
+        send_text(MY_WHATSAPP, wa_text(p, sd, fee_total))
     except Exception as e:
         send_text(MY_WHATSAPP, "22:00 曲奇寫入失敗：" + str(e) + "\nOCR：" + t[:500])
     cookie_photos.clear()
@@ -461,6 +516,38 @@ def fix():
     out["ok"] = True
     out["status"] = r.status_code
     out["result"] = r.text[:500]
+    return out
+
+@app.get("/fix-17")
+def fix17():
+    p = {}
+    p["date"] = "17-11-2026"
+    p["total"] = 187
+    p["boxes"] = {}
+    p["boxes"]["TSTN"] = 38
+    p["boxes"]["TSTG"] = 26
+    p["boxes"]["TST"] = 16
+    p["boxes"]["MK"] = 22
+    p["boxes"]["MPMK"] = 0
+    p["boxes"]["MOKO"] = 0
+    p["boxes"]["CENT"] = 29
+    p["boxes"]["HSP"] = 0
+    p["boxes"]["CPE"] = 15
+    p["boxes"]["CWB"] = 0
+    p["boxes"]["CYW"] = 17
+    p["boxes"]["AT1"] = 0
+    p["boxes"]["AT2"] = 0
+    p["boxes"]["ATRA"] = 16
+    p["boxes"]["APM"] = 8
+    p["boxes"]["KLN"] = 0
+    p["boxes"]["TM"] = 0
+    p["boxes"]["SH"] = 0
+    sd, row, fee_total = write_both(p, False)
+    out = {}
+    out["ok"] = True
+    out["row"] = sd
+    out["line"] = row
+    out["fee_total"] = fee_total
     return out
 
 @app.get("/test-22")
