@@ -78,7 +78,8 @@ def send_text(n, t):
         payload = {}
         payload["number"] = n
         payload["text"] = t
-        requests.post(url, json=payload, headers=head, timeout=20)
+        r = requests.post(url, json=payload, headers=head, timeout=20)
+        log("send_text " + str(r.status_code))
     except Exception as e:
         log(e)
 
@@ -407,6 +408,9 @@ def tms_daily_xls():
 
 def check_jobs():
     try:
+        if not TMS_GROUP_ID:
+            log("check_jobs no TMS_GROUP_ID")
+            return
         ws = sheet().open_by_key(TMS_SHEET_ID).worksheet("Jobs")
         vals = ws.get_all_values()
         if len(vals) < 2:
@@ -422,7 +426,7 @@ def check_jobs():
             if c in headers:
                 st_idx = headers.index(c)
                 break
-        first = len(jobs_snapshot) == 0
+        log("check_jobs rows " + str(len(vals) - 1))
         for r in vals[1:]:
             if not r:
                 continue
@@ -438,13 +442,12 @@ def check_jobs():
             line = " | ".join([x for x in r if x.strip()])
             if jid not in jobs_snapshot:
                 jobs_snapshot[jid] = st
-                if not first:
-                    if TMS_GROUP_ID:
-                        send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
+                send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
+                log("new job sent " + jid)
             elif jobs_snapshot[jid] != st:
                 jobs_snapshot[jid] = st
-                if TMS_GROUP_ID:
-                    send_text(TMS_GROUP_ID, "TMS 狀態變更\n" + line)
+                send_text(TMS_GROUP_ID, "TMS 狀態變更\n" + line)
+                log("status change sent " + jid)
     except Exception as e:
         log("check_jobs fail " + str(e))
 
@@ -496,6 +499,8 @@ def root():
     out = {}
     out["status"] = "running"
     out["cookie_photos"] = len(cookie_photos)
+    out["tms_group"] = bool(TMS_GROUP_ID)
+    out["jobs_seen"] = len(jobs_snapshot)
     out["logs"] = logs[-20:]
     return out
 
