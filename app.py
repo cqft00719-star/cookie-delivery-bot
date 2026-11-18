@@ -406,6 +406,21 @@ def tms_daily_xls():
     info = info + " 共 " + str(len(filtered)) + " 單"
     return bio.getvalue(), info
 
+def parse_created(s):
+    try:
+        s = str(s).strip()
+        if not s:
+            return None
+        s = s.replace(" HKT", "")
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
+            try:
+                return datetime.strptime(s, fmt)
+            except:
+                pass
+        return None
+    except:
+        return None
+
 def check_jobs():
     try:
         if not TMS_GROUP_ID:
@@ -426,7 +441,13 @@ def check_jobs():
             if c in headers:
                 st_idx = headers.index(c)
                 break
-        log("check_jobs rows " + str(len(vals) - 1))
+        ca_idx = None
+        for c in ["CreatedAt_HKT", "CreatedAt", "建立時間"]:
+            if c in headers:
+                ca_idx = headers.index(c)
+                break
+        is_first = len(jobs_snapshot) == 0
+        log("check_jobs rows " + str(len(vals) - 1) + " first=" + str(is_first))
         for r in vals[1:]:
             if not r:
                 continue
@@ -442,10 +463,30 @@ def check_jobs():
             line = " | ".join([x for x in r if x.strip()])
             if jid not in jobs_snapshot:
                 jobs_snapshot[jid] = st
-                send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
-                log("new job sent " + jid)
+                if is_first:
+                    up = st.strip().upper()
+                    if up in ["DELIVERED", "COMPLETED", "CANCELLED", "CANCEL"]:
+                        log("first skip old finished " + jid)
+                        continue
+                    ca = None
+                    if ca_idx is not None and ca_idx < len(r):
+                        ca = parse_created(r[ca_idx])
+                    if ca is None:
+                        log("first skip no CreatedAt " + jid)
+                        continue
+                    diff = datetime.now() - ca
+                    if diff.total_seconds() > 900:
+                        log("first skip old " + jid + " " + str(diff))
+                        continue
+                    send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
+                    log("first new job sent " + jid)
+                else:
+                    send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
+                    log("new job sent " + jid)
             elif jobs_snapshot[jid] != st:
                 jobs_snapshot[jid] = st
+                if is_first:
+                    continue
                 send_text(TMS_GROUP_ID, "TMS 狀態變更\n" + line)
                 log("status change sent " + jid)
     except Exception as e:
