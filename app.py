@@ -47,4 +47,27 @@ def send_xls(n, b, fn, cap):
         log(e)
 def dl_img(data):
     try:
-        r = requests.post(EVOLUTION_URL + "/chat/getBase64FromMediaMessage/" + quote(INSTANCE), json={"message": {"key": data.get("key", {}), "message": data.get("message", {})}}, headers={"apikey": EVOLUTION_API_KEY
+        url = EVOLUTION_URL + "/chat/getBase64FromMediaMessage/"
+        url = url + quote(INSTANCE)
+        key = data.get("key", {})
+        msg = data.get("message", {})
+        payload = {}
+        payload["message"] = {}
+        payload["message"]["key"] = key
+        payload["message"]["message"] = msg
+        head = {}
+        head["apikey"] = EVOLUTION_API_KEY
+        r = requests.post(url, json=payload, headers=head, timeout=60)
+        j = r.json()
+        b64 = j.get("base64") or ""
+        if not b64:
+            d2 = j.get("data", {})
+            b64 = d2.get("base64", "")
+        if not b64:
+            return None
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        return base64.b64decode(b64)
+    except Exception as e:
+        log(e)
+        return None
