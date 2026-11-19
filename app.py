@@ -323,28 +323,27 @@ async def webhook(request: Request):
         if not jid and isinstance(data, dict):
             jid = data.get("remoteJid") or ""
         last_webhook["jid"] = jid
-        log("WEBHOOK jid=" + str(jid) + " expect=" + COOKIE_GROUP_ID)
+        log("WEBHOOK jid=" + str(jid) + " expect=" + COOKIE_GROUP_ID + " fromMe=" + str(key.get("fromMe", False)))
         if ev and "upsert" not in ev.lower():
             log("WEBHOOK skip non-upsert")
             return {"ok": True}
-        if key.get("fromMe", False):
-            log("WEBHOOK skip fromMe")
-            return {"ok": True}
+        # FIX: 曲奇 Group 嘅相, 唔好因為 fromMe 就掉咗, 因為你自己 Forward 都係 fromMe
+        # 唔係曲奇 Group 嘅, 先至理 fromMe
         msg = data.get("message", {}) if isinstance(data, dict) else {}
         log("WEBHOOK msg_keys=" + str(list(msg.keys())[:10]))
         has_img = bool(msg.get("imageMessage") or msg.get("extendedTextMessage", {}).get("contextInfo", {}).get("quotedMessage", {}).get("imageMessage"))
         if not has_img:
             log("WEBHOOK no image, skip")
             return {"ok": True}
+        if jid != COOKIE_GROUP_ID:
+            log("WEBHOOK not cookie group, skip. got=" + str(jid))
+            return {"ok": True}
         img = dl_img(data)
         if not img:
             log("WEBHOOK dl_img failed")
             return {"ok": True}
-        # FIX: 就算 Group ID 唔啱, 都照收, 等你喺 Log 睇到真實 ID
         cookie_photos.append({"img": img, "jid": jid})
         log("COOKIE photo saved jid=" + str(jid) + " total=" + str(len(cookie_photos)))
-        if jid != COOKIE_GROUP_ID:
-            log("WARNING COOKIE_GROUP_ID mismatch! got=" + str(jid))
         return {"ok": True}
     except Exception as e:
         log("WEBHOOK ERR " + str(e))
