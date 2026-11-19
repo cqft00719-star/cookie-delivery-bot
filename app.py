@@ -47,6 +47,7 @@ FEES["SH"] = 250
 app = FastAPI()
 logs = []
 cookie_photos = []
+pod_photos = []
 jobs_snapshot = {}
 last_webhook = {}
 
@@ -195,7 +196,6 @@ def is_sgl(t):
 
 def parse(t):
     txt = t.replace("\r", "\n")
-    # 日期: OCR 成日將 18-11-2026 讀做 18-1-2026, 要糾正
     ds = None
     m = re.search(r"(\d{1,2})[-/. ](\d{1,2})[-/. ](202\d)", txt)
     if m:
@@ -222,29 +222,21 @@ def parse(t):
     m2 = re.search(r"總箱數[^0-9]{0,10}(\d{2,3})", txt)
     if m2:
         total = int(m2.group(1))
-    # FIX: 用 Token 順序嚟對, 唔用 substring 搵
-    # 將成篇文拆做 Token, TSTN 係一個 Token, 21 係下一個數字 Token
-    # 咁 TST 就唔會搶 TSTN 嘅數, MK 就唔會搶 MPMK 嘅數
     boxes = {}
     for s in SHOPS:
         boxes[s] = 0
-    # 先將中文、標點變做空格, 留返英文 Code 同數字
-    # 但要保留 Token 順序: 用 regex 搵出所有 [A-Z0-9]+ 嘅 Token, 按出現順序排
     tokens = re.findall(r"[A-Z0-9]+", txt.upper())
     log("parse tokens=" + str(tokens[:60]))
     for i, tok in enumerate(tokens):
         if tok in SHOPS:
-            # 睇之後 3 個 Token, 搵第一個純數字
             for j in range(i + 1, min(i + 4, len(tokens))):
                 nt = tokens[j]
                 if nt.isdigit():
                     v = int(nt)
                     if 0 < v <= 100:
-                        # 如果呢間舖已經有數, 唔好覆蓋, 因為第一個先係啱
                         if boxes[tok] == 0:
                             boxes[tok] = v
                     break
-                # 如果撞到下一間舖 Code, 即係呢間冇數, 唔好再搵落去
                 if nt in SHOPS:
                     break
     if not total:
@@ -355,25 +347,58 @@ async def webhook(request: Request):
         if not jid and isinstance(data, dict):
             jid = data.get("remoteJid") or ""
         last_webhook["jid"] = jid
-        log("WEBHOOK jid=" + str(jid) + " expect=" + COOKIE_GROUP_ID + " fromMe=" + str(key.get("fromMe", False)))
+        log("WEBHOOK jid=" + str(jid) + " expect_cookie=" + COOKIE_GROUP_ID + " tms=" + TMS_GROUP_ID + " fromMe=" + str(key.get("fromMe", False)))
         if ev and "upsert" not in ev.lower():
             log("WEBHOOK skip non-upsert")
             return {"ok": True}
         msg = data.get("message", {}) if isinstance(data, dict) else {}
         log("WEBHOOK msg_keys=" + str(list(msg.keys())[:10]))
+        # 攞埋 Caption / 文字, 等 POD 可以捉到 JOB 單號
+        cap = ""
+        try:
+            if msg.get("imageMessage"):
+                cap = msg.get("imageMessage", {}).get("caption", "") or ""
+            if msg.get("extendedTextMessage"):
+                cap = cap + " " + msg.get("extendedTextMessage", {}).get("text", "")
+            if msg.get("conversation"):
+                cap = cap + " " + msg.get("conversation", "")
+        except Exception:
+            cap = ""
+        log("WEBHOOK caption=" + cap[:200])
         has_img = bool(msg.get("imageMessage") or msg.get("extendedTextMessage", {}).get("contextInfo", {}).get("quotedMessage", {}).get("imageMessage"))
         if not has_img:
             log("WEBHOOK no image, skip")
             return {"ok": True}
-        if jid != COOKIE_GROUP_ID:
-            log("WEBHOOK not cookie group, skip. got=" + str(jid))
+        # 原本功能: 曲奇 Group
+        if jid == COOKIE_GROUP_ID:
+            img = dl_img(data)
+            if not img:
+                log("WEBHOOK dl_img failed cookie")
+                return {"ok": True}
+            cookie_photos.append({"img": img, "jid": jid})
+            log("COOKIE photo saved jid=" + str(jid) + " total=" + str(len(cookie_photos)))
             return {"ok": True}
-        img = dl_img(data)
-        if not img:
-            log("WEBHOOK dl_img failed")
+        # 新增, 唔刪原本: TMS / 運輸 (VIP單) Group 嘅相 = POD
+        if TMS_GROUP_ID and jid == TMS_GROUP_ID:
+            img = dl_img(data)
+            if not img:
+                log("WEBHOOK dl_img failed pod")
+                return {"ok": True}
+            # 試下喺 Caption 入面搵 JOB-xxxx
+            mjob = re.search(r"JOB-[A-Z0-9\-]+", cap.upper())
+            job = ""
+            if mjob:
+                job = mjob.group(0)
+            pod_photos.append({"img": img, "jid": jid, "job": job, "caption": cap})
+            log("POD photo saved jid=" + str(jid) + " job=" + job + " total=" + str(len(pod_photos)))
+            # 即刻話返俾你知收到 POD, 唔使等 Apps
+            if MY_WHATSAPP:
+                if job:
+                    send_text(MY_WHATSAPP, "POD 收到 " + job + "\n喺 運輸 (VIP單) Group 收到 POD 相，Apps 上傳唔到都唔緊要，呢度已經收到。\nCaption: " + cap[:100])
+                else:
+                    send_text(MY_WHATSAPP, "POD 收到 (未寫單號)\n喺 運輸 (VIP單) Group 收到 POD 相，Caption: " + cap[:100] + "\n記得叫司機打埋 JOB 單號。")
             return {"ok": True}
-        cookie_photos.append({"img": img, "jid": jid})
-        log("COOKIE photo saved jid=" + str(jid) + " total=" + str(len(cookie_photos)))
+        log("WEBHOOK not cookie / tms group, skip. got=" + str(jid))
         return {"ok": True}
     except Exception as e:
         log("WEBHOOK ERR " + str(e))
@@ -590,6 +615,7 @@ def root():
     out = {}
     out["status"] = "running"
     out["cookie_photos"] = len(cookie_photos)
+    out["pod_photos"] = len(pod_photos)
     out["cookie_group_expected"] = COOKIE_GROUP_ID
     out["last_webhook"] = last_webhook
     out["tms_group"] = bool(TMS_GROUP_ID)
