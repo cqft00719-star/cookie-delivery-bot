@@ -194,60 +194,59 @@ def is_sgl(t):
     return len(f) >= 3 and len(n) >= 5
 
 def parse(t):
-    # FIX: 唔再逐行搵, 成篇文咁搵, 舖 Code 同箱數隔咗幾行都搵到
-    # FIX: 日期 OCR 成日將 11 讀做 1, 讀到離譜日子就當返尋日
     txt = t.replace("\r", "\n")
-    # 日期: 先搵 18-11-2026 / 18/11/2026 / 18-1-2026 呢啲
+    # 日期: OCR 成日將 18-11-2026 讀做 18-1-2026, 要糾正
     ds = None
     m = re.search(r"(\d{1,2})[-/. ](\d{1,2})[-/. ](202\d)", txt)
     if m:
         d1 = int(m.group(1))
         d2 = int(m.group(2))
-        y = m.group(3)
-        # 如果 OCR 將 11 讀做 1, 而今日係 11 月, 嗰個 1 好大機會係 11
-        # 判斷: OCR 出嚟個日子同今日差超過 60 日, 就當佢讀錯, 用尋日
+        y = int(m.group(3))
         try:
-            cand = datetime(int(y), d2, d1)
+            cand = datetime(y, d2, d1)
             diff = abs((datetime.now() - cand).days)
-            if diff > 60:
-                # 18-1-2026 -> 18-11-2026 呢個最常見錯法
-                if d2 == 1:
-                    try:
-                        cand2 = datetime(int(y), 11, d1)
-                        if abs((datetime.now() - cand2).days) < 60:
-                            cand = cand2
-                        else:
-                            cand = datetime.now() - timedelta(days=1)
-                    except:
-                        cand = datetime.now() - timedelta(days=1)
+            if diff > 60 and d2 == 1:
+                cand2 = datetime(y, 11, d1)
+                if abs((datetime.now() - cand2).days) < 60:
+                    cand = cand2
                 else:
                     cand = datetime.now() - timedelta(days=1)
+            elif diff > 60:
+                cand = datetime.now() - timedelta(days=1)
             ds = cand.strftime("%d-%m-%Y")
         except:
             ds = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
     else:
         ds = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
-    # 總箱數: 直接搵 總箱數 後面個數
     total = 0
     m2 = re.search(r"總箱數[^0-9]{0,10}(\d{2,3})", txt)
     if m2:
         total = int(m2.group(1))
-    # 每間舖: SHOP Code 後面 0-40 個非數字字元 (包括換行、中文舖名), 再搵第一個數
-    # 要由長 Code 開始搵, 唔好俾 TST 搶走 TSTN / TSTG 嘅數
+    # FIX: 用 Token 順序嚟對, 唔用 substring 搵
+    # 將成篇文拆做 Token, TSTN 係一個 Token, 21 係下一個數字 Token
+    # 咁 TST 就唔會搶 TSTN 嘅數, MK 就唔會搶 MPMK 嘅數
     boxes = {}
     for s in SHOPS:
         boxes[s] = 0
-    # 將成篇文變做一個 string, 用 regex 逐個搵
-    # 注意: TSTN / TSTG / ATRA / AT1 / AT2 要先處理, 唔好俾短 Code 搶
-    order = ["TSTN", "TSTG", "ATRA", "MPMK", "MOKO", "CENT", "TST", "MK", "HSP", "CPE", "CWB", "CYW", "AT1", "AT2", "APM", "KLN", "TM", "SH"]
-    for s in order:
-        pat = s + r"[^0-9]{0,40}?(\d{1,3})"
-        mm = re.search(pat, txt, flags=re.DOTALL)
-        if mm:
-            v = int(mm.group(1))
-            # 箱數唔會大過 100, 大過就係讀錯隔離個數
-            if v <= 100:
-                boxes[s] = v
+    # 先將中文、標點變做空格, 留返英文 Code 同數字
+    # 但要保留 Token 順序: 用 regex 搵出所有 [A-Z0-9]+ 嘅 Token, 按出現順序排
+    tokens = re.findall(r"[A-Z0-9]+", txt.upper())
+    log("parse tokens=" + str(tokens[:60]))
+    for i, tok in enumerate(tokens):
+        if tok in SHOPS:
+            # 睇之後 3 個 Token, 搵第一個純數字
+            for j in range(i + 1, min(i + 4, len(tokens))):
+                nt = tokens[j]
+                if nt.isdigit():
+                    v = int(nt)
+                    if 0 < v <= 100:
+                        # 如果呢間舖已經有數, 唔好覆蓋, 因為第一個先係啱
+                        if boxes[tok] == 0:
+                            boxes[tok] = v
+                    break
+                # 如果撞到下一間舖 Code, 即係呢間冇數, 唔好再搵落去
+                if nt in SHOPS:
+                    break
     if not total:
         total = sum(boxes.values())
     out = {}
