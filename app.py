@@ -44,6 +44,16 @@ FEES["APM"] = 200
 FEES["KLN"] = 200
 FEES["TM"] = 250
 FEES["SH"] = 250
+SCAN_PER_BOX = 5
+# FIX: 通行計法要同 tms.py 一模一樣, 唔好再寫固定收費
+def scan_cost_for(shop, boxes):
+    if shop not in SHOPS:
+        return 0
+    mc = FEES.get(shop, 0)
+    included = mc // SCAN_PER_BOX
+    if boxes <= included:
+        return mc
+    return mc + (boxes - included) * SCAN_PER_BOX
 app = FastAPI()
 logs = []
 cookie_photos = []
@@ -101,9 +111,12 @@ def send_xls(n, b, fn, cap):
         payload["caption"] = cap
         payload["media"] = b64
         payload["fileName"] = fn
-        requests.post(url, json=payload, headers=head, timeout=60)
+        r = requests.post(url, json=payload, headers=head, timeout=60)
+        log("send_xls to " + str(n) + " " + str(r.status_code) + " " + r.text[:200])
+        return r.status_code in [200, 201]
     except Exception as e:
         log(e)
+        return False
 
 def dl_img(data):
     try:
@@ -298,9 +311,10 @@ def write_both(p, hl):
         if v == 0:
             rv2.append("")
         else:
-            f = FEES.get(s, 0)
-            rv2.append(f)
-            fee_total = fee_total + f
+            # FIX: 唔好再寫固定收費, 要用 scan_cost_for() 計埋超額, 同 tms.py 一樣
+            c = scan_cost_for(s, v)
+            rv2.append(c)
+            fee_total = fee_total + c
     ws2.update("B" + str(ri2) + ":S" + str(ri2), [rv2])
     ws2.update_cell(ri2, 20, fee_total)
     if hl:
@@ -353,7 +367,6 @@ async def webhook(request: Request):
             return {"ok": True}
         msg = data.get("message", {}) if isinstance(data, dict) else {}
         log("WEBHOOK msg_keys=" + str(list(msg.keys())[:10]))
-        # 攞埋 Caption / 文字, 等 POD 可以捉到 JOB 單號
         cap = ""
         try:
             if msg.get("imageMessage"):
@@ -369,7 +382,6 @@ async def webhook(request: Request):
         if not has_img:
             log("WEBHOOK no image, skip")
             return {"ok": True}
-        # 原本功能: 曲奇 Group
         if jid == COOKIE_GROUP_ID:
             img = dl_img(data)
             if not img:
@@ -378,20 +390,17 @@ async def webhook(request: Request):
             cookie_photos.append({"img": img, "jid": jid})
             log("COOKIE photo saved jid=" + str(jid) + " total=" + str(len(cookie_photos)))
             return {"ok": True}
-        # 新增, 唔刪原本: TMS / 運輸 (VIP單) Group 嘅相 = POD
         if TMS_GROUP_ID and jid == TMS_GROUP_ID:
             img = dl_img(data)
             if not img:
                 log("WEBHOOK dl_img failed pod")
                 return {"ok": True}
-            # 試下喺 Caption 入面搵 JOB-xxxx
             mjob = re.search(r"JOB-[A-Z0-9\-]+", cap.upper())
             job = ""
             if mjob:
                 job = mjob.group(0)
             pod_photos.append({"img": img, "jid": jid, "job": job, "caption": cap})
             log("POD photo saved jid=" + str(jid) + " job=" + job + " total=" + str(len(pod_photos)))
-            # 即刻話返俾你知收到 POD, 唔使等 Apps
             if MY_WHATSAPP:
                 if job:
                     send_text(MY_WHATSAPP, "POD 收到 " + job + "\n喺 運輸 (VIP單) Group 收到 POD 相，Apps 上傳唔到都唔緊要，呢度已經收到。\nCaption: " + cap[:100])
@@ -416,6 +425,30 @@ def cookie_xls(p):
         if v:
             w2.append([p["date"], s, int(v)])
     w2.append([p["date"], "總數", p["total"]])
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+def cookie_xls_multi(results):
+    # FIX: 22:00 要 Send 嘅 Excel, 唔係得一張相, 係成日所有相加埋
+    import openpyxl
+    wb = openpyxl.Workbook()
+    w2 = wb.active
+    w2.title = "今日送貨"
+    w2.append(["日期", "舖頭", "箱數", "通行"])
+    grand_boxes = 0
+    grand_fee = 0
+    for p, sd, fee_total in results:
+        for s in SHOPS:
+            v = p["boxes"].get(s, 0)
+            if v:
+                w2.append([p["date"], s, int(v), scan_cost_for(s, v)])
+        w2.append([p["date"], "總數", p["total"], fee_total])
+        grand_boxes += p["total"]
+        grand_fee += fee_total
+    w2.append([])
+    w2.append(["合計", "", grand_boxes, grand_fee])
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -562,8 +595,24 @@ def check_jobs():
     except Exception as e:
         log("check_jobs fail " + str(e))
 
+def write_daily_log(status):
+    try:
+        sh = sheet().open_by_key(TMS_SHEET_ID)
+        try:
+            ws = sh.worksheet("DailyLog")
+        except:
+            ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
+            ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
+        ws.append_row([datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%H:%M:%S"), status, str(datetime.now()), "app.py-auto"], value_input_option='USER_ENTERED')
+    except Exception as e:
+        log("DailyLog write fail " + str(e))
+
 def send17():
+    # FIX: 唔好再靜靜哋唔 Send, 冇 TMS_GROUP_ID 就要話返你知
     if not TMS_GROUP_ID:
+        log("send17 no TMS_GROUP_ID")
+        if MY_WHATSAPP:
+            send_text(MY_WHATSAPP, "17:00 TMS 每日提醒失敗：Railway 入面 TMS_GROUP_ID 未設定，冇 Send 去 運輸 (VIP單) Group。")
         return
     b, info = tms_daily_xls()
     if not b:
@@ -574,6 +623,8 @@ def send17():
         cap = "TMS每日提醒 " + datetime.now().strftime("%Y-%m-%d %H:%M")
         cap = cap + "\n" + info
         send_xls(TMS_GROUP_ID, b, fn, cap)
+    # 寫返入 DailyLog, 等 tms.py 嗰邊唔會重複 Send
+    write_daily_log("17:00 OK " + str(info)[:100])
 
 def send22():
     log("send22 start photos=" + str(len(cookie_photos)) + " my=" + str(MY_WHATSAPP))
@@ -584,23 +635,46 @@ def send22():
         send_text(MY_WHATSAPP, "22:00 曲奇：今日曲奇群組冇收到 SGL 相，冇嘢寫入。")
         log("send22 no photo sent")
         return
-    last = cookie_photos[-1]
-    img = last["img"]
-    t = ocr(img)
-    log("send22 ocr len=" + str(len(t)))
-    if not is_sgl(t):
-        send_text(MY_WHATSAPP, "22:00 曲奇：今日嗰張相 OCR 讀唔到 SCAN GLOBAL LOGISTICS，冇寫入。OCR 原文：\n" + t[:500])
-        cookie_photos.clear()
-        return
-    p = parse(t)
-    try:
-        sd, row, fee_total = write_both(p, True)
-        send_text(MY_WHATSAPP, wa_text(p, sd, fee_total))
-        log("send22 wrote " + sd)
-    except Exception as e:
-        send_text(MY_WHATSAPP, "22:00 曲奇寫入失敗：" + str(e) + "\nOCR：" + t[:500])
-        log("send22 write fail " + str(e))
+    # FIX: 唔好再淨係攞最後一張, 要逐張認晒
+    results = []
+    fail_msgs = []
+    photos = list(cookie_photos)
     cookie_photos.clear()
+    for idx, item in enumerate(photos):
+        img = item.get("img") if isinstance(item, dict) else item
+        t = ocr(img)
+        log("send22 photo " + str(idx+1) + "/" + str(len(photos)) + " ocr len=" + str(len(t)))
+        if not is_sgl(t):
+            fail_msgs.append(f"第{idx+1}張 OCR 讀唔到 SGL：{t[:200]}")
+            continue
+        p = parse(t)
+        try:
+            sd, row, fee_total = write_both(p, True)
+            results.append((p, sd, fee_total))
+            log("send22 wrote " + sd)
+        except Exception as e:
+            fail_msgs.append(f"第{idx+1}張 寫入失敗：{e} OCR：{t[:200]}")
+            log("send22 write fail " + str(e))
+    if not results:
+        send_text(MY_WHATSAPP, "22:00 曲奇：今日 " + str(len(photos)) + " 張相都認唔到 / 寫唔入。\n" + "\n".join(fail_msgs)[:1000])
+        return
+    # 文字 + Excel 一齊 Send 俾你自己, 唔係淨係 Send 文字
+    all_lines = []
+    for p, sd, fee_total in results:
+        all_lines.append(wa_text(p, sd, fee_total))
+        all_lines.append("---")
+    if fail_msgs:
+        all_lines.append("以下未能寫入：")
+        all_lines.extend(fail_msgs)
+    send_text(MY_WHATSAPP, "22:00 曲奇已寫入 " + str(len(results)) + " 張相\n\n" + "\n".join(all_lines)[:3000])
+    try:
+        xb = cookie_xls_multi(results)
+        fn = "Cookie_" + datetime.now().strftime("%Y-%m-%d") + ".xlsx"
+        cap = "22:00 曲奇已寫入 " + str(len(results)) + " 張相\n已寫入 運輸總表 + 通行，Excel 入面有晒今日所有舖頭箱數 + 通行。"
+        send_xls(MY_WHATSAPP, xb, fn, cap)
+    except Exception as e:
+        log("send22 xls fail " + str(e))
+        send_text(MY_WHATSAPP, "22:00 曲奇 Excel Send 失敗：" + str(e))
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
