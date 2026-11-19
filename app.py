@@ -194,35 +194,68 @@ def is_sgl(t):
     return len(f) >= 3 and len(n) >= 5
 
 def parse(t):
-    m = re.search(r"(\d{1,2})[-/. ](\d{1,2})[-/. ](202\d)", t)
+    # FIX: 唔再逐行搵, 成篇文咁搵, 舖 Code 同箱數隔咗幾行都搵到
+    # FIX: 日期 OCR 成日將 11 讀做 1, 讀到離譜日子就當返尋日
+    txt = t.replace("\r", "\n")
+    # 日期: 先搵 18-11-2026 / 18/11/2026 / 18-1-2026 呢啲
+    ds = None
+    m = re.search(r"(\d{1,2})[-/. ](\d{1,2})[-/. ](202\d)", txt)
     if m:
-        d1 = str(int(m.group(1))).zfill(2)
-        d2 = str(int(m.group(2))).zfill(2)
-        ds = d1 + "-" + d2 + "-" + m.group(3)
+        d1 = int(m.group(1))
+        d2 = int(m.group(2))
+        y = m.group(3)
+        # 如果 OCR 將 11 讀做 1, 而今日係 11 月, 嗰個 1 好大機會係 11
+        # 判斷: OCR 出嚟個日子同今日差超過 60 日, 就當佢讀錯, 用尋日
+        try:
+            cand = datetime(int(y), d2, d1)
+            diff = abs((datetime.now() - cand).days)
+            if diff > 60:
+                # 18-1-2026 -> 18-11-2026 呢個最常見錯法
+                if d2 == 1:
+                    try:
+                        cand2 = datetime(int(y), 11, d1)
+                        if abs((datetime.now() - cand2).days) < 60:
+                            cand = cand2
+                        else:
+                            cand = datetime.now() - timedelta(days=1)
+                    except:
+                        cand = datetime.now() - timedelta(days=1)
+                else:
+                    cand = datetime.now() - timedelta(days=1)
+            ds = cand.strftime("%d-%m-%Y")
+        except:
+            ds = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
     else:
-        ds = datetime.now().strftime("%d-%m-%Y")
-    m2 = re.search(r"總箱數[:：\s]*(\d+)", t)
+        ds = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
+    # 總箱數: 直接搵 總箱數 後面個數
     total = 0
+    m2 = re.search(r"總箱數[^0-9]{0,10}(\d{2,3})", txt)
     if m2:
         total = int(m2.group(1))
-    if not total:
-        ns = [int(x) for x in re.findall(r"\b(\d{2,3})\b", t)]
-        if ns:
-            total = max(ns)
+    # 每間舖: SHOP Code 後面 0-40 個非數字字元 (包括換行、中文舖名), 再搵第一個數
+    # 要由長 Code 開始搵, 唔好俾 TST 搶走 TSTN / TSTG 嘅數
     boxes = {}
-    lines = t.replace(",", " ").splitlines()
     for s in SHOPS:
         boxes[s] = 0
-        for line in lines:
-            if s in line.upper():
-                ns = [int(x) for x in re.findall(r"\b(\d{1,3})\b", line)]
-                if ns:
-                    boxes[s] = ns[-1]
+    # 將成篇文變做一個 string, 用 regex 逐個搵
+    # 注意: TSTN / TSTG / ATRA / AT1 / AT2 要先處理, 唔好俾短 Code 搶
+    order = ["TSTN", "TSTG", "ATRA", "MPMK", "MOKO", "CENT", "TST", "MK", "HSP", "CPE", "CWB", "CYW", "AT1", "AT2", "APM", "KLN", "TM", "SH"]
+    for s in order:
+        pat = s + r"[^0-9]{0,40}?(\d{1,3})"
+        mm = re.search(pat, txt, flags=re.DOTALL)
+        if mm:
+            v = int(mm.group(1))
+            # 箱數唔會大過 100, 大過就係讀錯隔離個數
+            if v <= 100:
+                boxes[s] = v
+    if not total:
+        total = sum(boxes.values())
     out = {}
     out["date"] = ds
     out["total"] = total
     out["boxes"] = boxes
     out["raw"] = t
+    log("parse result date=" + ds + " total=" + str(total) + " boxes=" + str(boxes))
     return out
 
 def yellow(ws, ri, cols):
@@ -327,8 +360,6 @@ async def webhook(request: Request):
         if ev and "upsert" not in ev.lower():
             log("WEBHOOK skip non-upsert")
             return {"ok": True}
-        # FIX: 曲奇 Group 嘅相, 唔好因為 fromMe 就掉咗, 因為你自己 Forward 都係 fromMe
-        # 唔係曲奇 Group 嘅, 先至理 fromMe
         msg = data.get("message", {}) if isinstance(data, dict) else {}
         log("WEBHOOK msg_keys=" + str(list(msg.keys())[:10]))
         has_img = bool(msg.get("imageMessage") or msg.get("extendedTextMessage", {}).get("contextInfo", {}).get("quotedMessage", {}).get("imageMessage"))
