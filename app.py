@@ -48,11 +48,12 @@ app = FastAPI()
 logs = []
 cookie_photos = []
 jobs_snapshot = {}
+last_webhook = {}
 
 def log(m):
     print(m, flush=True)
     logs.append(str(m))
-    if len(logs) > 100:
+    if len(logs) > 200:
         logs.pop(0)
 
 def creds():
@@ -79,9 +80,11 @@ def send_text(n, t):
         payload["number"] = n
         payload["text"] = t
         r = requests.post(url, json=payload, headers=head, timeout=20)
-        log("send_text " + str(r.status_code))
+        log("send_text to " + str(n) + " " + str(r.status_code) + " " + r.text[:200])
+        return r.status_code in [200, 201]
     except Exception as e:
-        log(e)
+        log("send_text fail " + str(e))
+        return False
 
 def send_xls(n, b, fn, cap):
     try:
@@ -114,18 +117,20 @@ def dl_img(data):
         head = {}
         head["apikey"] = EVOLUTION_API_KEY
         r = requests.post(url, json=payload, headers=head, timeout=60)
+        log("dl_img status " + str(r.status_code))
         j = r.json()
         b64 = j.get("base64") or ""
         if not b64:
             d2 = j.get("data", {})
             b64 = d2.get("base64", "")
         if not b64:
+            log("dl_img no base64 keys=" + str(list(j.keys())[:10]))
             return None
         if "," in b64:
             b64 = b64.split(",", 1)[1]
         return base64.b64decode(b64)
     except Exception as e:
-        log(e)
+        log("dl_img fail " + str(e))
         return None
 
 def ocr(img):
@@ -305,26 +310,44 @@ async def webhook(request: Request):
     except Exception:
         body = {}
     try:
+        last_webhook["time"] = datetime.now().strftime("%H:%M:%S")
+        last_webhook["event"] = str(body.get("event", ""))
+        last_webhook["body_keys"] = str(list(body.keys())[:10])
         ev = str(body.get("event", ""))
+        log("WEBHOOK hit event=" + ev + " keys=" + str(list(body.keys())[:10]))
+        data = body.get("data") or body
+        if isinstance(data, dict) and "key" not in data and "message" in body:
+            data = body
+        key = data.get("key", {}) if isinstance(data, dict) else {}
+        jid = key.get("remoteJid") or key.get("remoteJidAlt") or ""
+        if not jid and isinstance(data, dict):
+            jid = data.get("remoteJid") or ""
+        last_webhook["jid"] = jid
+        log("WEBHOOK jid=" + str(jid) + " expect=" + COOKIE_GROUP_ID)
         if ev and "upsert" not in ev.lower():
+            log("WEBHOOK skip non-upsert")
             return {"ok": True}
-        data = body.get("data") or {}
-        key = data.get("key", {})
-        jid = key.get("remoteJid") or ""
-        if jid != COOKIE_GROUP_ID:
+        if key.get("fromMe", False):
+            log("WEBHOOK skip fromMe")
             return {"ok": True}
-        msg = data.get("message", {}) or {}
-        if not msg.get("imageMessage"):
+        msg = data.get("message", {}) if isinstance(data, dict) else {}
+        log("WEBHOOK msg_keys=" + str(list(msg.keys())[:10]))
+        has_img = bool(msg.get("imageMessage") or msg.get("extendedTextMessage", {}).get("contextInfo", {}).get("quotedMessage", {}).get("imageMessage"))
+        if not has_img:
+            log("WEBHOOK no image, skip")
             return {"ok": True}
         img = dl_img(data)
         if not img:
+            log("WEBHOOK dl_img failed")
             return {"ok": True}
-        cookie_photos.append({"img": img})
-        log("COOKIE photo saved")
-        log("COOKIE total " + str(len(cookie_photos)))
+        # FIX: 就算 Group ID 唔啱, 都照收, 等你喺 Log 睇到真實 ID
+        cookie_photos.append({"img": img, "jid": jid})
+        log("COOKIE photo saved jid=" + str(jid) + " total=" + str(len(cookie_photos)))
+        if jid != COOKIE_GROUP_ID:
+            log("WARNING COOKIE_GROUP_ID mismatch! got=" + str(jid))
         return {"ok": True}
     except Exception as e:
-        log("ERR " + str(e))
+        log("WEBHOOK ERR " + str(e))
         log(traceback.format_exc())
         return JSONResponse({"ok": False}, status_code=200)
 
@@ -447,7 +470,6 @@ def check_jobs():
                 ca_idx = headers.index(c)
                 break
         is_first = len(jobs_snapshot) == 0
-        log("check_jobs rows " + str(len(vals) - 1) + " first=" + str(is_first))
         for r in vals[1:]:
             if not r:
                 continue
@@ -466,29 +488,23 @@ def check_jobs():
                 if is_first:
                     up = st.strip().upper()
                     if up in ["DELIVERED", "COMPLETED", "CANCELLED", "CANCEL"]:
-                        log("first skip old finished " + jid)
                         continue
                     ca = None
                     if ca_idx is not None and ca_idx < len(r):
                         ca = parse_created(r[ca_idx])
                     if ca is None:
-                        log("first skip no CreatedAt " + jid)
                         continue
                     diff = datetime.now() - ca
                     if diff.total_seconds() > 900:
-                        log("first skip old " + jid + " " + str(diff))
                         continue
                     send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
-                    log("first new job sent " + jid)
                 else:
                     send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
-                    log("new job sent " + jid)
             elif jobs_snapshot[jid] != st:
                 jobs_snapshot[jid] = st
                 if is_first:
                     continue
                 send_text(TMS_GROUP_ID, "TMS 狀態變更\n" + line)
-                log("status change sent " + jid)
     except Exception as e:
         log("check_jobs fail " + str(e))
 
@@ -506,15 +522,18 @@ def send17():
         send_xls(TMS_GROUP_ID, b, fn, cap)
 
 def send22():
+    log("send22 start photos=" + str(len(cookie_photos)) + " my=" + str(MY_WHATSAPP))
     if not MY_WHATSAPP:
-        log("No MY_WHATSAPP")
+        log("send22 No MY_WHATSAPP")
         return
     if not cookie_photos:
         send_text(MY_WHATSAPP, "22:00 曲奇：今日曲奇群組冇收到 SGL 相，冇嘢寫入。")
+        log("send22 no photo sent")
         return
     last = cookie_photos[-1]
     img = last["img"]
     t = ocr(img)
+    log("send22 ocr len=" + str(len(t)))
     if not is_sgl(t):
         send_text(MY_WHATSAPP, "22:00 曲奇：今日嗰張相 OCR 讀唔到 SCAN GLOBAL LOGISTICS，冇寫入。OCR 原文：\n" + t[:500])
         cookie_photos.clear()
@@ -523,8 +542,10 @@ def send22():
     try:
         sd, row, fee_total = write_both(p, True)
         send_text(MY_WHATSAPP, wa_text(p, sd, fee_total))
+        log("send22 wrote " + sd)
     except Exception as e:
         send_text(MY_WHATSAPP, "22:00 曲奇寫入失敗：" + str(e) + "\nOCR：" + t[:500])
+        log("send22 write fail " + str(e))
     cookie_photos.clear()
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -540,9 +561,12 @@ def root():
     out = {}
     out["status"] = "running"
     out["cookie_photos"] = len(cookie_photos)
+    out["cookie_group_expected"] = COOKIE_GROUP_ID
+    out["last_webhook"] = last_webhook
     out["tms_group"] = bool(TMS_GROUP_ID)
+    out["my_whatsapp"] = bool(MY_WHATSAPP)
     out["jobs_seen"] = len(jobs_snapshot)
-    out["logs"] = logs[-20:]
+    out["logs"] = logs[-30:]
     return out
 
 @app.get("/fix-webhook")
@@ -561,7 +585,19 @@ def fix():
     out = {}
     out["ok"] = True
     out["status"] = r.status_code
-    out["result"] = r.text[:500]
+    out["result"] = r.text[:800]
+    log("fix-webhook " + str(r.status_code) + " " + r.text[:500])
+    return out
+
+@app.get("/check-webhook")
+def checkwh():
+    url = EVOLUTION_URL + "/webhook/find/" + quote(INSTANCE)
+    head = {}
+    head["apikey"] = EVOLUTION_API_KEY
+    r = requests.get(url, headers=head, timeout=20)
+    out = {}
+    out["status"] = r.status_code
+    out["result"] = r.text[:1500]
     return out
 
 @app.get("/fix-17")
@@ -601,7 +637,7 @@ def test22():
     send22()
     out = {}
     out["ok"] = True
-    out["logs"] = logs[-10:]
+    out["logs"] = logs[-20:]
     return out
 
 @app.get("/test-17")
