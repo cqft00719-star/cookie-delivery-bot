@@ -17,6 +17,7 @@ BOT_URL = "https://cookie-delivery-bot-production.up.railway.app"
 GCP_JSON = os.getenv("GCP_JSON", "")
 MY_WHATSAPP = os.getenv("MY_WHATSAPP", "")
 TMS_GROUP_ID = os.getenv("TMS_GROUP_ID", "")
+TMS_GROUP_ID = TMS_GROUP_ID or "120363413020795341@g.us"
 COOKIE_GROUP_ID = os.getenv("COOKIE_GROUP_ID", "")
 COOKIE_GROUP_ID = COOKIE_GROUP_ID or "85264352282-1512209129@g.us"
 TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "")
