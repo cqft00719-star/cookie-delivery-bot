@@ -194,23 +194,17 @@ def ocr(img):
         return ""
 
 def is_sgl(t):
-    # FIX A: 收緊門檻, 唔好再用 SCAN / 出貨 / 3間舖+5個數就當係 SGL
     # 真 SGL 單一定要同時有齊: SCAN GLOBAL LOGISTICS + 身份證 + 總箱數 + Shop Code
-    # 其他司機 POD 相冇右下角身份證號碼, 會直接 Skip, 唔會再寫入 Sheet
+    # 其他司機 POD 相冇右下角身份證號碼, 會直接 Skip
     if not t:
         return False, "OCR 冇文字"
     u = t.upper()
     has_scan_global = ("SCAN" in u and "GLOBAL" in u) or "SCAN GLOBAL LOGISTICS" in u
     if not has_scan_global:
         return False, "冇 SCAN GLOBAL LOGISTICS"
-    # 身份證係關鍵: 真 SGL 單右下角有 身份證號碼, 其他 POD 相冇
-    has_id = ("身份證" in t) or ("身份證號碼" in t) or ("ID" in u and "2400" in t) or ("身份証" in t)
-    # OCR 有時會將 身份證 讀做 身份證號碼 / 身份証, 所以放寬少少, 但一定要有 身份 + 證/証 字
+    has_id = ("身份證" in t) or ("身份證號碼" in t) or ("身份証" in t) or ("身份" in t)
     if not has_id:
-        if "身份" in t:
-            has_id = True
-        else:
-            return False, "冇 身份證號碼 (右下角), 唔係真 SGL 單, 已 Skip"
+        return False, "冇 身份證號碼 (右下角), 唔係真 SGL 單, 已 Skip"
     if "總箱數" not in t and "總箱" not in t:
         return False, "冇 總箱數, 已 Skip"
     if "SHOP CODE" not in u and "SHOP" not in u:
@@ -276,7 +270,6 @@ def parse(t):
     return out
 
 def validate_sgl_parse(p):
-    # FIX A: 總箱數要對得返所有舖頭加埋, 差超過 5 箱就唔當係啱, 唔寫入
     s = sum(p["boxes"].values())
     if s == 0:
         return False, "所有舖頭都係 0 箱, 已 Skip"
@@ -403,7 +396,6 @@ async def webhook(request: Request):
         if not has_img:
             log("WEBHOOK no image, skip")
             return {"ok": True}
-        # FIX: 防重複, 同一個 Message ID 唔好儲兩次
         mid = key.get("id", "") or ""
         if mid:
             if mid in _seen_msg_ids:
@@ -412,6 +404,35 @@ async def webhook(request: Request):
             _seen_msg_ids.add(mid)
             if len(_seen_msg_ids) > 500:
                 _seen_msg_ids.clear()
+        # 1 對 1 背後測試: 你自己 DM 俾 Bot 嘅相, 只做測試, 唔寫入 Sheet, 唔 Send 去 Group
+        # 判斷: jid 入面有你自己電話 MY_WHATSAPP, 而且唔係 Group (Group 係 @g.us, DM 係 @s.whatsapp.net)
+        is_dm = (MY_WHATSAPP in str(jid)) and ("@g.us" not in str(jid))
+        if is_dm:
+            img = dl_img(data)
+            if not img:
+                send_text(MY_WHATSAPP, "背後測試：收唔到張相，下載失敗。")
+                return {"ok": True}
+            t = ocr(img)
+            ok, reason = is_sgl(t)
+            if not ok:
+                send_text(MY_WHATSAPP, "【背後測試 - 唔係 SGL，已 Skip，冇寫入】\n原因：" + reason + "\n\nOCR 讀到：\n" + t[:800])
+                return {"ok": True}
+            p = parse(t)
+            ok2, reason2 = validate_sgl_parse(p)
+            if not ok2:
+                send_text(MY_WHATSAPP, "【背後測試 - 係 SGL 但總數對唔返，已 Skip，冇寫入】\n原因：" + reason2 + "\n\nOCR 讀到：\n" + t[:800])
+                return {"ok": True}
+            fee = sum([scan_cost_for(s, v) for s, v in p["boxes"].items() if v])
+            txt_lines = ["【背後測試 - PASS，呢張如果係真嘅會咁寫】"]
+            txt_lines.append("日期：" + p["date"] + " 總箱數：" + str(p["total"]) + " 通行：$" + str(fee))
+            for s in SHOPS:
+                if p["boxes"].get(s, 0):
+                    txt_lines.append(s + " " + str(p["boxes"][s]))
+            txt_lines.append("")
+            txt_lines.append("⚠️ 呢個係測試，冇寫入 運輸總表 + 通行，冇 Send 去 Group。")
+            txt_lines.append("如果你確認呢張係真 SGL，先至去曲奇 Group Send 返一次，22:00 先會真係寫入。")
+            send_text(MY_WHATSAPP, "\n".join(txt_lines))
+            return {"ok": True}
         if jid == COOKIE_GROUP_ID:
             img = dl_img(data)
             if not img:
@@ -641,7 +662,6 @@ def send17():
         if MY_WHATSAPP:
             send_text(MY_WHATSAPP, "17:00 TMS 每日提醒失敗：Railway 入面 TMS_GROUP_ID 未設定，冇 Send 去 運輸 (VIP單) Group。")
         return
-    # FIX B: 17:00 自動 Send 之前, 先 Check 今日係咪已經 Send 過, 唔好重複
     if already_sent_today():
         log("send17 already sent today, skip")
         return
@@ -669,7 +689,6 @@ def send22():
     fail_msgs = []
     photos = list(cookie_photos)
     cookie_photos.clear()
-    # FIX A: 同一日有多張合格 SGL, 淨係要最新嗰張, 唔好兩張都寫入去蓋嚟蓋去
     by_date = {}
     for idx, item in enumerate(photos):
         img = item.get("img") if isinstance(item, dict) else item
@@ -686,7 +705,6 @@ def send22():
             fail_msgs.append(f"第{idx+1}張 SGL 但總數對唔返, 已 Skip: {reason2}")
             log("send22 validate fail " + reason2)
             continue
-        # 同一日只留最新一張
         by_date[p["date"]] = p
         log("send22 valid SGL for " + p["date"] + " total=" + str(p["total"]))
     for date_s, p in by_date.items():
@@ -812,7 +830,6 @@ def test22():
 
 @app.get("/test-17")
 def test17():
-    # 手動測試唔受 already_sent_today 限制, 等你可以隨時試
     if not TMS_GROUP_ID:
         return {"ok": False, "logs": ["no TMS_GROUP_ID"]}
     b, info = tms_daily_xls()
