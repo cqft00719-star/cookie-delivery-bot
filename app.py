@@ -4,7 +4,7 @@ import json
 import base64
 import traceback
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import requests
 from fastapi import FastAPI, Request
@@ -23,6 +23,9 @@ COOKIE_GROUP_ID = COOKIE_GROUP_ID or "85264352282-1512209129@g.us"
 TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "")
 TMS_SHEET_ID = TMS_SHEET_ID or "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35HmBNNVE"
 OCR_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
+HKT = timezone(timedelta(hours=8))
+def now_hk():
+    return datetime.now(HKT)
 SHOPS = ["TSTN", "TSTG", "TST", "MK", "MPMK", "MOKO"]
 SHOPS = SHOPS + ["CENT", "HSP", "CPE", "CWB", "CYW", "AT1"]
 SHOPS = SHOPS + ["AT2", "ATRA", "APM", "KLN", "TM", "SH"]
@@ -46,7 +49,6 @@ FEES["KLN"] = 200
 FEES["TM"] = 250
 FEES["SH"] = 250
 SCAN_PER_BOX = 5
-# FIX: 通行計法要同 tms.py 一模一樣, 唔好再寫固定收費
 def scan_cost_for(shop, boxes):
     if shop not in SHOPS:
         return 0
@@ -61,6 +63,7 @@ cookie_photos = []
 pod_photos = []
 jobs_snapshot = {}
 last_webhook = {}
+_seen_msg_ids = set()
 
 def log(m):
     print(m, flush=True)
@@ -191,22 +194,31 @@ def ocr(img):
         return ""
 
 def is_sgl(t):
+    # FIX A: 收緊門檻, 唔好再用 SCAN / 出貨 / 3間舖+5個數就當係 SGL
+    # 真 SGL 單一定要同時有齊: SCAN GLOBAL LOGISTICS + 身份證 + 總箱數 + Shop Code
+    # 其他司機 POD 相冇右下角身份證號碼, 會直接 Skip, 唔會再寫入 Sheet
     if not t:
-        return False
+        return False, "OCR 冇文字"
     u = t.upper()
-    if "SGL" in u:
-        return True
-    if "SCAN" in u:
-        return True
-    if "LOGISTICS" in u:
-        return True
-    if "出貨" in t:
-        return True
-    if "送貨單" in t:
-        return True
+    has_scan_global = ("SCAN" in u and "GLOBAL" in u) or "SCAN GLOBAL LOGISTICS" in u
+    if not has_scan_global:
+        return False, "冇 SCAN GLOBAL LOGISTICS"
+    # 身份證係關鍵: 真 SGL 單右下角有 身份證號碼, 其他 POD 相冇
+    has_id = ("身份證" in t) or ("身份證號碼" in t) or ("ID" in u and "2400" in t) or ("身份証" in t)
+    # OCR 有時會將 身份證 讀做 身份證號碼 / 身份証, 所以放寬少少, 但一定要有 身份 + 證/証 字
+    if not has_id:
+        if "身份" in t:
+            has_id = True
+        else:
+            return False, "冇 身份證號碼 (右下角), 唔係真 SGL 單, 已 Skip"
+    if "總箱數" not in t and "總箱" not in t:
+        return False, "冇 總箱數, 已 Skip"
+    if "SHOP CODE" not in u and "SHOP" not in u:
+        return False, "冇 Shop Code 表頭, 已 Skip"
     f = [s for s in SHOPS if s in u]
-    n = re.findall(r"\b\d{1,3}\b", t)
-    return len(f) >= 3 and len(n) >= 5
+    if len(f) < 5:
+        return False, f"舖頭得 {len(f)} 間, 少過 5 間, 已 Skip"
+    return True, "PASS"
 
 def parse(t):
     txt = t.replace("\r", "\n")
@@ -218,20 +230,20 @@ def parse(t):
         y = int(m.group(3))
         try:
             cand = datetime(y, d2, d1)
-            diff = abs((datetime.now() - cand).days)
+            diff = abs((now_hk().replace(tzinfo=None) - cand).days)
             if diff > 60 and d2 == 1:
                 cand2 = datetime(y, 11, d1)
-                if abs((datetime.now() - cand2).days) < 60:
+                if abs((now_hk().replace(tzinfo=None) - cand2).days) < 60:
                     cand = cand2
                 else:
-                    cand = datetime.now() - timedelta(days=1)
+                    cand = now_hk().replace(tzinfo=None) - timedelta(days=1)
             elif diff > 60:
-                cand = datetime.now() - timedelta(days=1)
+                cand = now_hk().replace(tzinfo=None) - timedelta(days=1)
             ds = cand.strftime("%d-%m-%Y")
         except:
-            ds = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
+            ds = (now_hk() - timedelta(days=1)).strftime("%d-%m-%Y")
     else:
-        ds = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
+        ds = (now_hk() - timedelta(days=1)).strftime("%d-%m-%Y")
     total = 0
     m2 = re.search(r"總箱數[^0-9]{0,10}(\d{2,3})", txt)
     if m2:
@@ -262,6 +274,15 @@ def parse(t):
     out["raw"] = t
     log("parse result date=" + ds + " total=" + str(total) + " boxes=" + str(boxes))
     return out
+
+def validate_sgl_parse(p):
+    # FIX A: 總箱數要對得返所有舖頭加埋, 差超過 5 箱就唔當係啱, 唔寫入
+    s = sum(p["boxes"].values())
+    if s == 0:
+        return False, "所有舖頭都係 0 箱, 已 Skip"
+    if p["total"] and abs(p["total"] - s) > 5:
+        return False, f"總箱數 {p['total']} 同舖頭加埋 {s} 差超過 5, 可能 OCR 讀錯, 已 Skip, 請人手對"
+    return True, "PASS"
 
 def yellow(ws, ri, cols):
     try:
@@ -312,7 +333,6 @@ def write_both(p, hl):
         if v == 0:
             rv2.append("")
         else:
-            # FIX: 唔好再寫固定收費, 要用 scan_cost_for() 計埋超額, 同 tms.py 一樣
             c = scan_cost_for(s, v)
             rv2.append(c)
             fee_total = fee_total + c
@@ -349,7 +369,7 @@ async def webhook(request: Request):
     except Exception:
         body = {}
     try:
-        last_webhook["time"] = datetime.now().strftime("%H:%M:%S")
+        last_webhook["time"] = now_hk().strftime("%H:%M:%S")
         last_webhook["event"] = str(body.get("event", ""))
         last_webhook["body_keys"] = str(list(body.keys())[:10])
         ev = str(body.get("event", ""))
@@ -383,12 +403,21 @@ async def webhook(request: Request):
         if not has_img:
             log("WEBHOOK no image, skip")
             return {"ok": True}
+        # FIX: 防重複, 同一個 Message ID 唔好儲兩次
+        mid = key.get("id", "") or ""
+        if mid:
+            if mid in _seen_msg_ids:
+                log("WEBHOOK duplicate msg id, skip " + mid[:20])
+                return {"ok": True}
+            _seen_msg_ids.add(mid)
+            if len(_seen_msg_ids) > 500:
+                _seen_msg_ids.clear()
         if jid == COOKIE_GROUP_ID:
             img = dl_img(data)
             if not img:
                 log("WEBHOOK dl_img failed cookie")
                 return {"ok": True}
-            cookie_photos.append({"img": img, "jid": jid})
+            cookie_photos.append({"img": img, "jid": jid, "ts": now_hk(), "mid": mid})
             log("COOKIE photo saved jid=" + str(jid) + " total=" + str(len(cookie_photos)))
             return {"ok": True}
         if TMS_GROUP_ID and jid == TMS_GROUP_ID:
@@ -415,24 +444,7 @@ async def webhook(request: Request):
         log(traceback.format_exc())
         return JSONResponse({"ok": False}, status_code=200)
 
-def cookie_xls(p):
-    import openpyxl
-    wb = openpyxl.Workbook()
-    w2 = wb.active
-    w2.title = "今日送貨"
-    w2.append(["日期", "舖頭", "箱數"])
-    for s in SHOPS:
-        v = p["boxes"].get(s, 0)
-        if v:
-            w2.append([p["date"], s, int(v)])
-    w2.append([p["date"], "總數", p["total"]])
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
 def cookie_xls_multi(results):
-    # FIX: 22:00 要 Send 嘅 Excel, 唔係得一張相, 係成日所有相加埋
     import openpyxl
     wb = openpyxl.Workbook()
     w2 = wb.active
@@ -469,7 +481,7 @@ def tms_daily_xls():
             break
     if date_idx is None:
         return None, "Jobs 冇 Date 欄"
-    tomorrow = (datetime.now() + timedelta(days=1)).date()
+    tomorrow = (now_hk() + timedelta(days=1)).date()
     day_after = tomorrow + timedelta(days=1)
     filtered = []
     for r in vals[1:]:
@@ -582,7 +594,7 @@ def check_jobs():
                         ca = parse_created(r[ca_idx])
                     if ca is None:
                         continue
-                    diff = datetime.now() - ca
+                    diff = now_hk().replace(tzinfo=None) - ca
                     if diff.total_seconds() > 900:
                         continue
                     send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
@@ -604,27 +616,44 @@ def write_daily_log(status):
         except:
             ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
             ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
-        ws.append_row([datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%H:%M:%S"), status, str(datetime.now()), "app.py-auto"], value_input_option='USER_ENTERED')
+        ws.append_row([now_hk().strftime("%Y-%m-%d"), now_hk().strftime("%H:%M:%S"), status, str(now_hk()), "app.py-auto"], value_input_option='USER_ENTERED')
     except Exception as e:
         log("DailyLog write fail " + str(e))
 
+def already_sent_today():
+    try:
+        sh = sheet().open_by_key(TMS_SHEET_ID)
+        ws = sh.worksheet("DailyLog")
+        vals = ws.get_all_values()
+        today_s = now_hk().strftime("%Y-%m-%d")
+        for r in reversed(vals[1:]):
+            if r and r[0].strip() == today_s:
+                if "17:00" in str(r[2]) or "OK" in str(r[2]) or "MANUAL" in str(r[2]):
+                    return True
+        return False
+    except Exception as e:
+        log("already_sent_today fail " + str(e))
+        return False
+
 def send17():
-    # FIX: 唔好再靜靜哋唔 Send, 冇 TMS_GROUP_ID 就要話返你知
     if not TMS_GROUP_ID:
         log("send17 no TMS_GROUP_ID")
         if MY_WHATSAPP:
             send_text(MY_WHATSAPP, "17:00 TMS 每日提醒失敗：Railway 入面 TMS_GROUP_ID 未設定，冇 Send 去 運輸 (VIP單) Group。")
         return
+    # FIX B: 17:00 自動 Send 之前, 先 Check 今日係咪已經 Send 過, 唔好重複
+    if already_sent_today():
+        log("send17 already sent today, skip")
+        return
     b, info = tms_daily_xls()
     if not b:
-        txt = "TMS每日提醒 " + datetime.now().strftime("%Y-%m-%d")
+        txt = "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d")
         send_text(TMS_GROUP_ID, txt + " " + info)
     else:
-        fn = "TMS_" + datetime.now().strftime("%Y-%m-%d") + ".xlsx"
-        cap = "TMS每日提醒 " + datetime.now().strftime("%Y-%m-%d %H:%M")
+        fn = "TMS_" + now_hk().strftime("%Y-%m-%d") + ".xlsx"
+        cap = "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d %H:%M")
         cap = cap + "\n" + info
         send_xls(TMS_GROUP_ID, b, fn, cap)
-    # 寫返入 DailyLog, 等 tms.py 嗰邊唔會重複 Send
     write_daily_log("17:00 OK " + str(info)[:100])
 
 def send22():
@@ -636,42 +665,53 @@ def send22():
         send_text(MY_WHATSAPP, "22:00 曲奇：今日曲奇群組冇收到 SGL 相，冇嘢寫入。")
         log("send22 no photo sent")
         return
-    # FIX: 唔好再淨係攞最後一張, 要逐張認晒
     results = []
     fail_msgs = []
     photos = list(cookie_photos)
     cookie_photos.clear()
+    # FIX A: 同一日有多張合格 SGL, 淨係要最新嗰張, 唔好兩張都寫入去蓋嚟蓋去
+    by_date = {}
     for idx, item in enumerate(photos):
         img = item.get("img") if isinstance(item, dict) else item
         t = ocr(img)
         log("send22 photo " + str(idx+1) + "/" + str(len(photos)) + " ocr len=" + str(len(t)))
-        if not is_sgl(t):
-            fail_msgs.append(f"第{idx+1}張 OCR 讀唔到 SGL：{t[:200]}")
+        ok, reason = is_sgl(t)
+        if not ok:
+            fail_msgs.append(f"第{idx+1}張唔係 SGL, 已 Skip: {reason}")
+            log("send22 skip photo " + str(idx+1) + " " + reason)
             continue
         p = parse(t)
+        ok2, reason2 = validate_sgl_parse(p)
+        if not ok2:
+            fail_msgs.append(f"第{idx+1}張 SGL 但總數對唔返, 已 Skip: {reason2}")
+            log("send22 validate fail " + reason2)
+            continue
+        # 同一日只留最新一張
+        by_date[p["date"]] = p
+        log("send22 valid SGL for " + p["date"] + " total=" + str(p["total"]))
+    for date_s, p in by_date.items():
         try:
             sd, row, fee_total = write_both(p, True)
             results.append((p, sd, fee_total))
             log("send22 wrote " + sd)
         except Exception as e:
-            fail_msgs.append(f"第{idx+1}張 寫入失敗：{e} OCR：{t[:200]}")
+            fail_msgs.append(f"{date_s} 寫入失敗：{e}")
             log("send22 write fail " + str(e))
     if not results:
-        send_text(MY_WHATSAPP, "22:00 曲奇：今日 " + str(len(photos)) + " 張相都認唔到 / 寫唔入。\n" + "\n".join(fail_msgs)[:1000])
+        send_text(MY_WHATSAPP, "22:00 曲奇：今日 " + str(len(photos)) + " 張相, 冇一張係合格 SGL (要有 SCAN GLOBAL + 身份證 + 總箱數, 同總數要對得返)。\n" + "\n".join(fail_msgs)[:1500])
         return
-    # 文字 + Excel 一齊 Send 俾你自己, 唔係淨係 Send 文字
     all_lines = []
     for p, sd, fee_total in results:
         all_lines.append(wa_text(p, sd, fee_total))
         all_lines.append("---")
     if fail_msgs:
-        all_lines.append("以下未能寫入：")
+        all_lines.append("以下已 Skip (唔係 SGL / 總數對唔返)：")
         all_lines.extend(fail_msgs)
-    send_text(MY_WHATSAPP, "22:00 曲奇已寫入 " + str(len(results)) + " 張相\n\n" + "\n".join(all_lines)[:3000])
+    send_text(MY_WHATSAPP, "22:00 曲奇已寫入 " + str(len(results)) + " 張 SGL 單\n\n" + "\n".join(all_lines)[:3000])
     try:
         xb = cookie_xls_multi(results)
-        fn = "Cookie_" + datetime.now().strftime("%Y-%m-%d") + ".xlsx"
-        cap = "22:00 曲奇已寫入 " + str(len(results)) + " 張相\n已寫入 運輸總表 + 通行，Excel 入面有晒今日所有舖頭箱數 + 通行。"
+        fn = "Cookie_" + now_hk().strftime("%Y-%m-%d") + ".xlsx"
+        cap = "22:00 曲奇已寫入 " + str(len(results)) + " 張 SGL 單\n已寫入 運輸總表 + 通行，Excel 入面有晒今日所有舖頭箱數 + 通行。"
         send_xls(MY_WHATSAPP, xb, fn, cap)
     except Exception as e:
         log("send22 xls fail " + str(e))
@@ -772,7 +812,16 @@ def test22():
 
 @app.get("/test-17")
 def test17():
-    send17()
+    # 手動測試唔受 already_sent_today 限制, 等你可以隨時試
+    if not TMS_GROUP_ID:
+        return {"ok": False, "logs": ["no TMS_GROUP_ID"]}
+    b, info = tms_daily_xls()
+    if not b:
+        send_text(TMS_GROUP_ID, "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d") + " " + info + " (手動測試)")
+    else:
+        fn = "TMS_" + now_hk().strftime("%Y-%m-%d") + ".xlsx"
+        cap = "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d %H:%M") + "\n" + info + " (手動測試)"
+        send_xls(TMS_GROUP_ID, b, fn, cap)
     out = {}
     out["ok"] = True
     out["logs"] = logs[-10:]
