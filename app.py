@@ -53,7 +53,6 @@ def log(m):
     if len(logs) > 200:
         logs.pop(0)
 
-# ===== FIX: 相唔再只放 RAM，寫落 /tmp，restart 都唔會唔見 =====
 def persist_cookie_photo(img_bytes, mid):
     try:
         fn = os.path.join(COOKIE_DIR, f"{now_hk().strftime('%Y%m%d_%H%M%S')}_{mid[:12]}.jpg")
@@ -145,7 +144,6 @@ def dl_img(data):
         log("dl_img fail " + str(e))
         return None
 
-# ===== FIX: 專為呢款 SGL Form 改嘅 OCR，cht + eng 一齊試 =====
 def ocr(img):
     try:
         data = img
@@ -177,7 +175,6 @@ def ocr(img):
                         log("OCR:" + t[:1000])
                         return t
                     if t and t.strip():
-                        # 讀到嘢但冇 SCAN，留低做 debug，唔好即刻 return，等下一個 lang 再試
                         log(f"OCR lang={lang} eng={eng} no SCAN, try next: {t[:200]}")
                 except Exception as e:
                     log("OCR fail " + str(e))
@@ -186,15 +183,12 @@ def ocr(img):
         log(str(e))
         return ""
 
-# ===== FIX: 專為呢款 SGL Form 改嘅 is_sgl，計分制 =====
 def is_sgl(t):
     if not t:
         return False, "OCR 冇文字"
     u = t.upper()
-    has_scan = ("SCAN" in u and "GLOBAL" in u) or "SCAN GLOBAL" in u or "SCAN" in u and "LOGISTICS" in u
-    # 呢款 Form 最準嘅特徵：Shop Code + 箱數 表頭
+    has_scan = ("SCAN" in u and "GLOBAL" in u) or "SCAN GLOBAL" in u or ("SCAN" in u and "LOGISTICS" in u)
     has_table = ("SHOP" in u and "CODE" in u) or ("箱數" in t) or ("SHOP CODE" in u)
-    # 右下角身份證 - 手寫成日讀唔到，只做加分，唔做死門
     has_id = any(x in t for x in ["身份證", "身份証", "身分證", "身份", "身分", "身份證號", "ID NO", "HKID"])
     has_total = ("總箱數" in t or "總箱" in t or "TOTAL" in u or "總數" in t)
     found = [s for s in SHOPS if s in u]
@@ -211,7 +205,6 @@ def is_sgl(t):
 
 def parse(t):
     txt = t.replace("\r", "\n")
-    # 日期：呢款 Form 日期喺右下角 23-11-2026，拎最尾嗰個日期先啱
     ds = (now_hk() - timedelta(days=1)).strftime("%d-%m-%Y")
     dates = re.findall(r"(\d{1,2})[-/. ](\d{1,2})[-/. ](202\d)", txt)
     if dates:
@@ -248,7 +241,6 @@ def parse(t):
                 if nt in SHOPS:
                     break
     s = sum(boxes.values())
-    # 關鍵修正：手寫 101 好易讀做 10，個 1 俾人切咗。如果總箱數讀到 10，但舖頭加埋係 90-110，就信舖頭加埋嗰個
     if total == 10 and 90 <= s <= 110:
         total = s
     if not total:
@@ -261,7 +253,6 @@ def validate_sgl_parse(p):
     s = sum(p["boxes"].values())
     if s == 0:
         return False, "所有舖頭都係 0 箱, 已 Skip"
-    # 舊版差 >5 就 Skip，呢款手寫單差少少好正常，放寬到 >15 先 Skip
     if p["total"] and abs(p["total"] - s) > 15:
         return False, f"總箱數 {p['total']} 同舖頭加埋 {s} 差超過 15, 可能 OCR 讀錯, 已 Skip, 請人手對"
     return True, "PASS"
@@ -281,7 +272,6 @@ def _ensure_header(ws, expected):
             ws.update('A1', [expected], value_input_option='USER_ENTERED')
             return
         first = [h.strip() for h in vals[0]]
-        # tms.py 舊版格式：第一行係收費 / 空白，第二行係舖頭，要還原返做 app.py 格式
         if first[0] == "" or "200" in first or "380" in first or "500" in first:
             ws.update('A1', [expected], value_input_option='USER_ENTERED')
             return
@@ -401,30 +391,34 @@ async def webhook(request: Request):
                 return {"ok": True}
             _seen_msg_ids.add(mid)
             if len(_seen_msg_ids) > 500: _seen_msg_ids.clear()
-        # DM 背後測試：你自己 DM 俾 Bot，只測試唔寫入
-        is_dm = (MY_WHATSAPP and MY_WHATSAPP in str(jid)) and ("@g.us" not in str(jid))
+        # ===== FIX LID: 唔再靠電話號碼對 MY_WHATSAPP =====
+        # 舊版：MY_WHATSAPP (852...) in jid (8050...@lid) -> 永遠對唔上 -> Skip
+        # 新版：只要唔係 Group (@g.us)，就當係 DM，@lid 同 @s.whatsapp.net 都係 DM
+        is_dm = ("@g.us" not in str(jid))
         if is_dm:
             img = dl_img({"key": key, "message": inner if inner != msg else msg})
             if not img:
-                send_text(MY_WHATSAPP, "背後測試：收唔到張相，下載失敗。")
+                # DM 嗰陣要 Send 返去邊個？jid 本身就係 sender，唔好用 MY_WHATSAPP 電話號碼
+                # 因為 Evolution 而家用 LID，Send 去 LID 先收到
+                send_text(jid, "背後測試：收唔到張相，下載失敗。")
                 return {"ok": True}
             t = ocr(img)
             ok, reason = is_sgl(t)
             if not ok:
-                send_text(MY_WHATSAPP, "【背後測試 - 唔係 SGL，已 Skip，冇寫入】\n原因：" + reason + "\n\nOCR 讀到：\n" + t[:800])
+                send_text(jid, "\n原因：" + reason + "\n\nOCR 讀到：\n" + t[:800])
                 return {"ok": True}
             p = parse(t)
             ok2, reason2 = validate_sgl_parse(p)
             if not ok2:
-                send_text(MY_WHATSAPP, "【背後測試 - 係 SGL 但總數對唔返，已 Skip，冇寫入】\n原因：" + reason2 + "\n\nOCR 讀到：\n" + t[:800])
+                send_text(jid, "\n原因：" + reason2 + "\n\nOCR 讀到：\n" + t[:800])
                 return {"ok": True}
             fee = sum([scan_cost_for(s, v) for s, v in p["boxes"].items() if v])
-            txt_lines = ["【背後測試 - PASS，呢張如果係真嘅會咁寫】"]
+            txt_lines = [""]
             txt_lines.append("日期：" + p["date"] + " 總箱數：" + str(p["total"]) + " 通行：$" + str(fee))
             for s in SHOPS:
                 if p["boxes"].get(s, 0): txt_lines.append(s + " " + str(p["boxes"][s]))
             txt_lines += ["", "⚠️ 呢個係測試，冇寫入 運輸總表 + 通行，冇 Send 去 Group。", "如果你確認呢張係真 SGL，先至去曲奇 Group Send 返一次，22:00 先會真係寫入。"]
-            send_text(MY_WHATSAPP, "\n".join(txt_lines))
+            send_text(jid, "\n".join(txt_lines))
             return {"ok": True}
         if _is_cookie_group(jid):
             img = dl_img({"key": key, "message": inner if inner != msg else msg})
@@ -639,7 +633,6 @@ def send22():
     except Exception as e:
         send_text(MY_WHATSAPP, "22:00 曲奇 Excel Send 失敗：" + str(e))
 
-# ===== FIX: 時區一定要喺 CronTrigger 入面再寫一次，唔好只寫喺 Scheduler =====
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 sc = BackgroundScheduler(timezone="Asia/Hong_Kong")
