@@ -20,7 +20,7 @@ MY_WHATSAPP = os.getenv("MY_WHATSAPP", "")
 TMS_GROUP_ID = os.getenv("TMS_GROUP_ID", "") or "120363413020795341@g.us"
 COOKIE_GROUP_ID = os.getenv("COOKIE_GROUP_ID", "") or "85264352282-1512209129@g.us"
 TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "") or "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35HmBNNVE"
-# OCR 已刪除：唔再用 OCR_SPACE_API_KEY，唔再估手寫數
+# OCR 已刪除，曲奇相唔再留、唔再回覆
 HKT = timezone(timedelta(hours=8))
 def now_hk():
     return datetime.now(HKT)
@@ -54,28 +54,11 @@ def log(m):
         logs.pop(0)
 
 def persist_cookie_photo(img_bytes, mid):
-    try:
-        fn = os.path.join(COOKIE_DIR, f"{now_hk().strftime('%Y%m%d_%H%M%S')}_{mid[:12]}.jpg")
-        with open(fn, "wb") as f:
-            f.write(img_bytes)
-        return fn
-    except Exception as e:
-        log(f"persist photo fail {e}")
-        return ""
+    # 已停用：唔再留曲奇相，留返呢個 function 係為咗唔好報錯，但唔會再叫佢
+    return ""
 def load_persisted_photos():
-    try:
-        for fn in sorted(glob.glob(os.path.join(COOKIE_DIR, "*.jpg"))):
-            try:
-                with open(fn, "rb") as f:
-                    img = f.read()
-                if img and not any(p.get("fn") == fn for p in cookie_photos):
-                    cookie_photos.append({"img": img, "jid": COOKIE_GROUP_ID, "ts": now_hk(), "mid": os.path.basename(fn), "fn": fn})
-            except: pass
-        if cookie_photos:
-            log(f"loaded persisted cookie photos={len(cookie_photos)}")
-    except Exception as e:
-        log(f"load persisted fail {e}")
-load_persisted_photos()
+    # 已停用：唔再載入舊相
+    return
 
 def creds():
     from google.oauth2.service_account import Credentials
@@ -145,7 +128,6 @@ def dl_img(data):
         return None
 
 # OCR 已全部刪除：ocr() / is_sgl() / parse() / validate_sgl_parse() 已刪
-# 曲奇送貨唔再用 OCR 估數，改做 tms.py 手動入數
 
 def _is_cookie_group(jid):
     j = str(jid)
@@ -199,23 +181,16 @@ async def webhook(request: Request):
                 return {"ok": True}
             _seen_msg_ids.add(mid)
             if len(_seen_msg_ids) > 500: _seen_msg_ids.clear()
-        # DM：OCR 已停用，唔再認相，只覆提示
+        # ===== 已改：任何人 DM send 相，唔回覆、唔下載、唔留相 =====
         is_dm = ("@g.us" not in str(jid))
         if is_dm:
-            # 唔下載、唔 OCR，直接覆
-            send_text(jid, "OCR 已停用。\n曲奇送貨唔再用 OCR 認相，請去 TMS > 通行 SCAN > ✍️ 手動入曲奇數，睇住張相逐間打箱數，撳掣就寫入 運輸總表 + 通行。")
+            log("DM photo ignored - NO reply, NO save, NO OCR")
             return {"ok": True}
+        # ===== 已改：曲奇 Group send 相，唔下載、唔留相、唔回覆 =====
         if _is_cookie_group(jid):
-            img = dl_img({"key": key, "message": inner if inner != msg else msg})
-            if not img:
-                log("WEBHOOK dl_img failed cookie")
-                return {"ok": True}
-            fn = persist_cookie_photo(img, mid or "noid")
-            cookie_photos.append({"img": img, "jid": jid, "ts": now_hk(), "mid": mid, "fn": fn})
-            log("COOKIE photo saved (NO OCR) jid=" + str(jid) + " total=" + str(len(cookie_photos)))
-            # 唔 OCR，唔寫 Sheet，只覆已收到
-            # 注意：唔好喺 Group 度嘈，淨係記低就算，22:00 先一次過提醒你
+            log("COOKIE photo ignored - NO save, NO reply, NO OCR")
             return {"ok": True}
+        # ===== 保留：運輸 (VIP單) Group 嘅 POD 仲要通知你 =====
         if TMS_GROUP_ID and jid == TMS_GROUP_ID:
             img = dl_img(data)
             if not img:
@@ -357,29 +332,22 @@ def send17():
     write_daily_log("17:00 OK " + str(info)[:100])
 
 def send22():
-    # OCR 已刪除：22:00 唔再 OCR、唔再寫 Sheet，只提醒你去 tms.py 手動入數
-    load_persisted_photos()
-    log("send22 (NO OCR) start photos=" + str(len(cookie_photos)))
-    if not MY_WHATSAPP:
-        log("send22 No MY_WHATSAPP"); return
-    if not cookie_photos:
-        send_text(MY_WHATSAPP, "22:00 曲奇：今日曲奇群組冇收到 SGL 相，冇嘢要入。\nOCR 已停用，如有相請去 TMS > 通行 SCAN > 手動入數。")
-        return
-    n = len(cookie_photos)
-    # 唔清相，留返喺 /tmp 等你對完先，唔好刪
-    send_text(MY_WHATSAPP, f"22:00 曲奇提醒 (OCR 已停用)\n今日曲奇群組收到 {n} 張 SGL 相，Bot 冇 OCR、冇寫入。\n請去 TMS > 通行 SCAN > ✍️ 手動入曲奇數，睇住張相逐間打箱數，撳掣就寫入 運輸總表 + 通行。")
+    # 已停用：22:00 唔再提醒曲奇，唔再留相，唔會再 Send
+    log("send22 disabled - NO OCR, NO save, NO reply")
+    return
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 sc = BackgroundScheduler(timezone="Asia/Hong_Kong")
 sc.add_job(send17, CronTrigger(hour=17, minute=0, timezone="Asia/Hong_Kong"))
-sc.add_job(send22, CronTrigger(hour=22, minute=0, timezone="Asia/Hong_Kong"))
+# 已停用 22:00：唔加 send22，唔會再 Send 曲奇提醒
+# sc.add_job(send22, CronTrigger(hour=22, minute=0, timezone="Asia/Hong_Kong"))
 sc.add_job(check_jobs, CronTrigger(minute="*/5", timezone="Asia/Hong_Kong"))
 sc.start()
 
 @app.get("/")
 def root():
-    return {"status": "running", "ocr": "disabled", "time_hkt": now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "cookie_photos": len(cookie_photos), "pod_photos": len(pod_photos), "cookie_group_expected": COOKIE_GROUP_ID, "last_webhook": last_webhook, "tms_group": bool(TMS_GROUP_ID), "my_whatsapp": bool(MY_WHATSAPP), "jobs_seen": len(jobs_snapshot), "logs": logs[-30:]}
+    return {"status": "running", "ocr": "disabled", "cookie_photo_save": "disabled", "dm_reply": "disabled", "time_hkt": now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "cookie_photos": len(cookie_photos), "pod_photos": len(pod_photos), "cookie_group_expected": COOKIE_GROUP_ID, "last_webhook": last_webhook, "tms_group": bool(TMS_GROUP_ID), "my_whatsapp": bool(MY_WHATSAPP), "jobs_seen": len(jobs_snapshot), "logs": logs[-30:]}
 
 @app.get("/fix-webhook")
 def fix():
