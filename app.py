@@ -20,7 +20,7 @@ MY_WHATSAPP = os.getenv("MY_WHATSAPP", "")
 TMS_GROUP_ID = os.getenv("TMS_GROUP_ID", "") or "120363413020795341@g.us"
 COOKIE_GROUP_ID = os.getenv("COOKIE_GROUP_ID", "") or "85264352282-1512209129@g.us"
 TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "") or "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35HmBNNVE"
-OCR_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
+# OCR 已刪除：唔再用 OCR_SPACE_API_KEY，唔再估手寫數
 HKT = timezone(timedelta(hours=8))
 def now_hk():
     return datetime.now(HKT)
@@ -144,258 +144,8 @@ def dl_img(data):
         log("dl_img fail " + str(e))
         return None
 
-def ocr(img):
-    try:
-        data = img
-        try:
-            from PIL import Image, ImageOps, ImageEnhance
-            im = Image.open(io.BytesIO(img)).convert("RGB")
-            im = ImageOps.exif_transpose(im)
-            im.thumbnail((2200, 2200))
-            im = ImageEnhance.Contrast(im).enhance(1.4)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=90)
-            data = buf.getvalue()
-        except Exception as e:
-            log("PIL skip " + str(e))
-        for lang in ["cht", "eng", "chi_tra"]:
-            for eng in ["2", "1"]:
-                try:
-                    url = "https://api.ocr.space/parse/image"
-                    files = {"file": ("s.jpg", data, "image/jpeg")}
-                    dd = {"apikey": OCR_KEY, "language": lang, "OCREngine": eng, "scale": "true", "isTable": "true"}
-                    r = requests.post(url, files=files, data=dd, timeout=60)
-                    j = r.json()
-                    t = ""
-                    try:
-                        t = j["ParsedResults"][0]["ParsedText"]
-                    except: t = ""
-                    if t and "SCAN" in t.upper():
-                        log(f"OCR lang={lang} eng={eng} OK len={len(t)}")
-                        log("OCR:" + t[:1500])
-                        return t
-                    if t and t.strip():
-                        log(f"OCR lang={lang} eng={eng} no SCAN, try next: {t[:200]}")
-                except Exception as e:
-                    log("OCR fail " + str(e))
-        return ""
-    except Exception as e:
-        log(str(e))
-        return ""
-
-def is_sgl(t):
-    if not t:
-        return False, "OCR 冇文字"
-    u = t.upper()
-    has_scan = ("SCAN" in u and "GLOBAL" in u) or "SCAN GLOBAL" in u or ("SCAN" in u and "LOGISTICS" in u)
-    has_table = ("SHOP" in u and "CODE" in u) or ("箱數" in t) or ("SHOP CODE" in u)
-    has_id = any(x in t for x in ["身份證", "身份証", "身分證", "身份", "身分", "身份證號", "ID NO", "HKID"])
-    has_total = ("總箱數" in t or "總箱" in t or "TOTAL" in u or "總數" in t)
-    found = [s for s in SHOPS if s in u]
-    score = (1 if has_scan else 0) + (1 if has_table else 0) + (1 if has_id else 0) + (1 if has_total else 0) + (1 if len(found) >= 3 else 0)
-    if has_scan and has_table and len(found) >= 3:
-        return True, f"PASS 呢款 SGL Form score={score} shops={found} has_id={has_id}"
-    if not has_scan:
-        return False, "冇 SCAN GLOBAL LOGISTICS"
-    if not has_table:
-        return False, "冇 Shop Code / 箱數 表頭，唔係呢款 SGL Form"
-    if len(found) < 3:
-        return False, f"舖頭得 {len(found)} 間 ({found})，少過 3 間，已 Skip"
-    return False, f"分數唔夠 score={score}，已 Skip"
-
-# ===== FIX: 逐行讀，唔好再用 Token 數格仔 =====
-def parse(t):
-    txt = t.replace("\r", "\n")
-    ds = (now_hk() - timedelta(days=1)).strftime("%d-%m-%Y")
-    dates = re.findall(r"(\d{1,2})[-/. ](\d{1,2})[-/. ](202\d)", txt)
-    if dates:
-        d1, d2, y = map(int, dates[-1])
-        try:
-            cand = datetime(y, d2, d1)
-            if abs((now_hk().replace(tzinfo=None) - cand).days) > 60:
-                cand = now_hk().replace(tzinfo=None) - timedelta(days=1)
-            ds = cand.strftime("%d-%m-%Y")
-        except:
-            pass
-    # --- 總箱數：處理 101 讀做 10 / 嘅情況 ---
-    total = 0
-    total_raw = ""
-    for line in txt.split("\n"):
-        if "總箱數" in line or "總數" in line or "TOTAL" in line.upper():
-            total_raw = line
-            break
-    if total_raw:
-        # 例如 "總箱數： 10 /" -> 10 後面有 /，即係個 1 俾人讀做 /，還原做 101
-        m_slash = re.search(r"(\d{1,2})\s*/", total_raw)
-        if m_slash:
-            total = int(m_slash.group(1) + "1")
-        else:
-            m2 = re.search(r"(\d{1,3})", total_raw)
-            if m2:
-                total = int(m2.group(1))
-    if not total:
-        m2 = re.search(r"總箱數[^0-9]{0,10}(\d{1,3})", txt)
-        if m2:
-            total = int(m2.group(1))
-    # --- 舖頭：逐行讀，每行最尾嗰個數字先係箱數 ---
-    boxes = {s: 0 for s in SHOPS}
-    lines = txt.split("\n")
-    # 長 Code 要先認，唔好俾 TST 食咗 TSTN / TSTG，ATRA 食咗 AT1
-    shops_sorted = sorted(SHOPS, key=lambda x: -len(x))
-    for idx, line in enumerate(lines):
-        u = line.upper()
-        # 跳過總數行、標題行
-        if "總箱數" in line or "總數" in line or "SHOP CODE" in u:
-            continue
-        found_shop = None
-        for s in shops_sorted:
-            # 要成個 Code 出現，唔好俾 K11 呢啲干擾
-            # 用 \b，AT1 唔會誤認 ATRA，TST 唔會誤認 TSTN
-            if re.search(r"\b" + re.escape(s) + r"\b", u):
-                found_shop = s
-                break
-            # OCR 有時會將 TSTN 讀做 TSTH / TSTW，做少少容錯
-            if s == "TSTN" and re.search(r"\bTST[HN W]\b", u):
-                found_shop = s
-                break
-        if not found_shop:
-            continue
-        # 呢行入面嘅數字，最尾嗰個先係箱數
-        # 例如 "TST 尖沙咀 K11 10" -> 數字有 11, 10，最尾 10 先係箱數
-        # 例如 "AT1 機場 (T1) 9" -> 數字有 1, 9，最尾 9 先係箱數
-        # 例如 "TSTG 尖沙咀 (金馬倫) 14" -> 數字得 14，就係箱數
-        nums = re.findall(r"\d{1,2}", line)
-        if not nums:
-            continue
-        # 如果行入面有 K11 / T1 / T2 呢啲，頭幾個數字係舖頭名，唔係箱數，要 Skip 咗佢哋
-        # 策略：拎最尾嗰個數字，但如果最尾數字係 11 / 1 / 2 呢啲疑似舖頭名，就再睇埋下一行
-        v = int(nums[-1])
-        # 特殊情況：呢行得一個數字，又係 1 / 2 / 11，極可能係舖頭名，唔係箱數
-        if len(nums) == 1 and v in [1, 2, 11]:
-            continue
-        if 0 < v <= 100 and boxes[found_shop] == 0:
-            boxes[found_shop] = v
-    # --- Fallback：如果逐行讀到嘅總數太細，可能係 OCR 將數字推咗去下一行，用舊 Token 法補底 ---
-    s = sum(boxes.values())
-    if s < 30:
-        tokens = re.findall(r"[A-Z0-9]+", txt.upper())
-        tokens = [{"TSTH":"TSTN","TSTW":"TSTN","M0K0":"MOKO"}.get(x, x) for x in tokens]
-        for i, tok in enumerate(tokens):
-            if tok in SHOPS and boxes[tok] == 0:
-                for j in range(i+1, min(i+6, len(tokens))):
-                    nt = tokens[j]
-                    if nt in ["K11", "T1", "T2"]:
-                        continue
-                    if nt.isdigit():
-                        v = int(nt)
-                        if 0 < v <= 100:
-                            boxes[tok] = v
-                        break
-                    if nt in SHOPS:
-                        break
-        s = sum(boxes.values())
-    # --- 總數修正：手寫 101 讀做 10 / 10 嘅情況 ---
-    # 如果總數係 10，但舖頭加埋係 90-110，就信舖頭加埋嗰個
-    if total == 10 and 90 <= s <= 110:
-        total = s
-    # 如果總數係 10 / 已經還原做 101，但舖頭加埋仲係細（因為有啲行 OCR 漏咗數字），
-    # 唔好將總數改細，留返 101 俾人手對，唔好 Skip
-    if not total:
-        total = s
-    out = {"date": ds, "total": total, "boxes": boxes, "raw": t}
-    log("parse line-based date=" + ds + " total=" + str(total) + " boxes=" + str(boxes) + " total_raw=" + total_raw)
-    return out
-
-def validate_sgl_parse(p):
-    s = sum(p["boxes"].values())
-    if s == 0:
-        return False, "所有舖頭都係 0 箱, 已 Skip"
-    # FIX: 唔再因為對唔返就 Skip，照 PASS 但彈警告，唔好冇咗張單
-    if p["total"] and abs(p["total"] - s) > 15:
-        return True, f"⚠️ 警告：總箱數 {p['total']} 同舖頭加埋 {s} 差超過 15，OCR 可能漏咗幾行數字，照 PASS 但請人手對一次。已讀到嘅舖頭：{ {k:v for k,v in p['boxes'].items() if v} }"
-    return True, "PASS"
-
-def yellow(ws, ri, cols):
-    try:
-        for c in cols:
-            col = chr(64 + c) if c <= 26 else "A" + chr(64 + c - 26)
-            ws.format(col + str(ri), {"backgroundColor": {"red": 1, "green": 1, "blue": 0}})
-    except Exception as e:
-        log("yellow fail " + str(e))
-
-def _ensure_header(ws, expected):
-    try:
-        vals = ws.get_all_values()
-        if not vals:
-            ws.update('A1', [expected], value_input_option='USER_ENTERED')
-            return
-        first = [h.strip() for h in vals[0]]
-        if first[0] == "" or "200" in first or "380" in first or "500" in first:
-            ws.update('A1', [expected], value_input_option='USER_ENTERED')
-            return
-        if first[0].lower() not in ["date", "日期"] and first[0] != "Date":
-            ws.insert_row(expected, 1, value_input_option='USER_ENTERED')
-    except Exception as e:
-        log(f"ensure_header fail {e}")
-
-def write_both(p, hl):
-    import time as _time
-    sh = sheet().open_by_key(TMS_SHEET_ID)
-    dt = datetime.strptime(p["date"], "%d-%m-%Y")
-    sd = dt.strftime("%d-%b")
-    expected = ["Date"] + SHOPS + ["總箱數"]
-    ws1 = sh.worksheet("運輸總表")
-    _ensure_header(ws1, expected)
-    vals1 = ws1.get_all_values()
-    ri = None
-    for i, r in enumerate(vals1[1:], start=2):
-        if r and r[0].strip() == sd:
-            ri = i; break
-    if not ri:
-        ri = len(vals1) + 1
-        ws1.update_cell(ri, 1, sd)
-    rv = [p["boxes"].get(s, 0) if p["boxes"].get(s, 0) != 0 else "" for s in SHOPS]
-    for attempt in range(3):
-        try:
-            ws1.update(f"B{ri}:S{ri}", [rv]); break
-        except Exception as e:
-            if "429" in str(e): _time.sleep(5); continue
-            raise
-    ws1.update_cell(ri, 20, p["total"])
-    ws2 = sh.worksheet("通行")
-    _ensure_header(ws2, expected)
-    vals2 = ws2.get_all_values()
-    ri2 = None
-    for i, r in enumerate(vals2[1:], start=2):
-        if r and r[0].strip() == sd:
-            ri2 = i; break
-    if not ri2:
-        ri2 = len(vals2) + 1
-        ws2.update_cell(ri2, 1, sd)
-    rv2 = []; fee_total = 0
-    for s in SHOPS:
-        v = p["boxes"].get(s, 0)
-        if v == 0: rv2.append("")
-        else:
-            c = scan_cost_for(s, v); rv2.append(c); fee_total += c
-    ws2.update(f"B{ri2}:S{ri2}", [rv2])
-    ws2.update_cell(ri2, 20, fee_total)
-    if hl:
-        cols1 = [idx for idx, s in enumerate(SHOPS, start=2) if p["boxes"].get(s, 0) > 0]
-        yellow(ws1, ri, cols1); yellow(ws1, ri, [20])
-        yellow(ws2, ri2, cols1); yellow(ws2, ri2, [20])
-    return sd, ri, fee_total
-
-def wa_text(p, sd, fee_total):
-    lines = [p["date"] + " 曲奇送貨已寫入"]
-    for s in SHOPS:
-        v = p["boxes"].get(s, 0)
-        if v: lines.append(s + " " + str(v))
-    lines.append("總箱數：" + str(p["total"]))
-    lines.append("通行總數：$" + str(fee_total))
-    lines.append("已寫入 運輸總表 + 通行 " + sd)
-    lines.append("黃色格 = OCR 估嘅，請喺 Sheet 對一次")
-    return "\n".join(lines)
+# OCR 已全部刪除：ocr() / is_sgl() / parse() / validate_sgl_parse() 已刪
+# 曲奇送貨唔再用 OCR 估數，改做 tms.py 手動入數
 
 def _is_cookie_group(jid):
     j = str(jid)
@@ -449,30 +199,11 @@ async def webhook(request: Request):
                 return {"ok": True}
             _seen_msg_ids.add(mid)
             if len(_seen_msg_ids) > 500: _seen_msg_ids.clear()
+        # DM：OCR 已停用，唔再認相，只覆提示
         is_dm = ("@g.us" not in str(jid))
         if is_dm:
-            img = dl_img({"key": key, "message": inner if inner != msg else msg})
-            if not img:
-                send_text(jid, "背後測試：收唔到張相，下載失敗。")
-                return {"ok": True}
-            t = ocr(img)
-            ok, reason = is_sgl(t)
-            if not ok:
-                send_text(jid, "【背後測試 - 唔係 SGL，已 Skip，冇寫入】\n原因：" + reason + "\n\nOCR 讀到：\n" + t[:1200])
-                return {"ok": True}
-            p = parse(t)
-            ok2, reason2 = validate_sgl_parse(p)
-            if not ok2:
-                send_text(jid, "【背後測試 - 係 SGL 但總數對唔返，已 Skip，冇寫入】\n原因：" + reason2 + "\n\nOCR 讀到：\n" + t[:1200])
-                return {"ok": True}
-            fee = sum([scan_cost_for(s, v) for s, v in p["boxes"].items() if v])
-            txt_lines = ["【背後測試 - 係 SGL，已 Skip，冇寫入】"]
-            txt_lines.append(reason2)
-            txt_lines.append("日期：" + p["date"] + " 總箱數：" + str(p["total"]) + " 通行：$" + str(fee))
-            for s in SHOPS:
-                if p["boxes"].get(s, 0): txt_lines.append(s + " " + str(p["boxes"][s]))
-            txt_lines += ["", "⚠️ 呢個係測試，冇寫入 運輸總表 + 通行，冇 Send 去 Group。", "如果你確認呢張係真 SGL，先至去曲奇 Group Send 返一次，22:00 先會真係寫入。"]
-            send_text(jid, "\n".join(txt_lines))
+            # 唔下載、唔 OCR，直接覆
+            send_text(jid, "OCR 已停用。\n曲奇送貨唔再用 OCR 認相，請去 TMS > 通行 SCAN > ✍️ 手動入曲奇數，睇住張相逐間打箱數，撳掣就寫入 運輸總表 + 通行。")
             return {"ok": True}
         if _is_cookie_group(jid):
             img = dl_img({"key": key, "message": inner if inner != msg else msg})
@@ -481,7 +212,9 @@ async def webhook(request: Request):
                 return {"ok": True}
             fn = persist_cookie_photo(img, mid or "noid")
             cookie_photos.append({"img": img, "jid": jid, "ts": now_hk(), "mid": mid, "fn": fn})
-            log("COOKIE photo saved jid=" + str(jid) + " total=" + str(len(cookie_photos)))
+            log("COOKIE photo saved (NO OCR) jid=" + str(jid) + " total=" + str(len(cookie_photos)))
+            # 唔 OCR，唔寫 Sheet，只覆已收到
+            # 注意：唔好喺 Group 度嘈，淨係記低就算，22:00 先一次過提醒你
             return {"ok": True}
         if TMS_GROUP_ID and jid == TMS_GROUP_ID:
             img = dl_img(data)
@@ -501,22 +234,6 @@ async def webhook(request: Request):
         log("WEBHOOK ERR " + str(e))
         log(traceback.format_exc())
         return JSONResponse({"ok": False}, status_code=200)
-
-def cookie_xls_multi(results):
-    import openpyxl
-    wb = openpyxl.Workbook()
-    w2 = wb.active; w2.title = "今日送貨"
-    w2.append(["日期", "舖頭", "箱數", "通行"])
-    grand_boxes = 0; grand_fee = 0
-    for p, sd, fee_total in results:
-        for s in SHOPS:
-            v = p["boxes"].get(s, 0)
-            if v: w2.append([p["date"], s, int(v), scan_cost_for(s, v)])
-        w2.append([p["date"], "總數", p["total"], fee_total])
-        grand_boxes += p["total"]; grand_fee += fee_total
-    w2.append([]); w2.append(["合計", "", grand_boxes, grand_fee])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return bio.getvalue()
 
 def tms_daily_xls():
     import openpyxl
@@ -640,52 +357,17 @@ def send17():
     write_daily_log("17:00 OK " + str(info)[:100])
 
 def send22():
+    # OCR 已刪除：22:00 唔再 OCR、唔再寫 Sheet，只提醒你去 tms.py 手動入數
     load_persisted_photos()
-    log("send22 start photos=" + str(len(cookie_photos)) + " my=" + str(MY_WHATSAPP))
+    log("send22 (NO OCR) start photos=" + str(len(cookie_photos)))
     if not MY_WHATSAPP:
         log("send22 No MY_WHATSAPP"); return
     if not cookie_photos:
-        send_text(MY_WHATSAPP, "22:00 曲奇：今日曲奇群組冇收到 SGL 相，冇嘢寫入。")
+        send_text(MY_WHATSAPP, "22:00 曲奇：今日曲奇群組冇收到 SGL 相，冇嘢要入。\nOCR 已停用，如有相請去 TMS > 通行 SCAN > 手動入數。")
         return
-    results = []; fail_msgs = []
-    photos = list(cookie_photos); cookie_photos.clear()
-    for p in photos:
-        try:
-            if p.get("fn") and os.path.exists(p["fn"]): os.remove(p["fn"])
-        except: pass
-    by_date = {}
-    for idx, item in enumerate(photos):
-        img = item.get("img") if isinstance(item, dict) else item
-        t = ocr(img)
-        ok, reason = is_sgl(t)
-        if not ok:
-            fail_msgs.append(f"第{idx+1}張唔係 SGL, 已 Skip: {reason}"); continue
-        p = parse(t)
-        ok2, reason2 = validate_sgl_parse(p)
-        if not ok2:
-            fail_msgs.append(f"第{idx+1}張 SGL 但總數對唔返, 已 Skip: {reason2}"); continue
-        by_date[p["date"]] = p
-    for date_s, p in by_date.items():
-        try:
-            sd, row, fee_total = write_both(p, True)
-            results.append((p, sd, fee_total))
-        except Exception as e:
-            fail_msgs.append(f"{date_s} 寫入失敗：{e}")
-            log("send22 write fail " + str(e))
-    if not results:
-        send_text(MY_WHATSAPP, "22:00 曲奇：今日 " + str(len(photos)) + " 張相, 冇一張係合格 SGL。\n" + "\n".join(fail_msgs)[:1500])
-        return
-    all_lines = []
-    for p, sd, fee_total in results:
-        all_lines.append(wa_text(p, sd, fee_total)); all_lines.append("---")
-    if fail_msgs:
-        all_lines.append("以下已 Skip："); all_lines.extend(fail_msgs)
-    send_text(MY_WHATSAPP, "22:00 曲奇已寫入 " + str(len(results)) + " 張 SGL 單\n\n" + "\n".join(all_lines)[:3000])
-    try:
-        xb = cookie_xls_multi(results)
-        send_xls(MY_WHATSAPP, xb, "Cookie_" + now_hk().strftime("%Y-%m-%d") + ".xlsx", "22:00 曲奇已寫入 " + str(len(results)) + " 張 SGL 單\n已寫入 運輸總表 + 通行")
-    except Exception as e:
-        send_text(MY_WHATSAPP, "22:00 曲奇 Excel Send 失敗：" + str(e))
+    n = len(cookie_photos)
+    # 唔清相，留返喺 /tmp 等你對完先，唔好刪
+    send_text(MY_WHATSAPP, f"22:00 曲奇提醒 (OCR 已停用)\n今日曲奇群組收到 {n} 張 SGL 相，Bot 冇 OCR、冇寫入。\n請去 TMS > 通行 SCAN > ✍️ 手動入曲奇數，睇住張相逐間打箱數，撳掣就寫入 運輸總表 + 通行。")
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -697,7 +379,7 @@ sc.start()
 
 @app.get("/")
 def root():
-    return {"status": "running", "time_hkt": now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "cookie_photos": len(cookie_photos), "pod_photos": len(pod_photos), "cookie_group_expected": COOKIE_GROUP_ID, "last_webhook": last_webhook, "tms_group": bool(TMS_GROUP_ID), "my_whatsapp": bool(MY_WHATSAPP), "jobs_seen": len(jobs_snapshot), "logs": logs[-30:]}
+    return {"status": "running", "ocr": "disabled", "time_hkt": now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "cookie_photos": len(cookie_photos), "pod_photos": len(pod_photos), "cookie_group_expected": COOKIE_GROUP_ID, "last_webhook": last_webhook, "tms_group": bool(TMS_GROUP_ID), "my_whatsapp": bool(MY_WHATSAPP), "jobs_seen": len(jobs_snapshot), "logs": logs[-30:]}
 
 @app.get("/fix-webhook")
 def fix():
@@ -713,12 +395,6 @@ def checkwh():
     url = EVOLUTION_URL + "/webhook/find/" + quote(INSTANCE)
     r = requests.get(url, headers={"apikey": EVOLUTION_API_KEY}, timeout=20)
     return {"status": r.status_code, "result": r.text[:1500]}
-
-@app.get("/fix-17")
-def fix17():
-    p = {"date": "17-11-2026", "total": 187, "boxes": {"TSTN":38,"TSTG":26,"TST":16,"MK":22,"MPMK":0,"MOKO":0,"CENT":29,"HSP":0,"CPE":15,"CWB":0,"CYW":17,"AT1":0,"AT2":0,"ATRA":16,"APM":8,"KLN":0,"TM":0,"SH":0}}
-    sd, row, fee_total = write_both(p, False)
-    return {"ok": True, "row": sd, "line": row, "fee_total": fee_total}
 
 @app.get("/test-22")
 def test22():
