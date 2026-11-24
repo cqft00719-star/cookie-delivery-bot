@@ -172,7 +172,7 @@ def ocr(img):
                     except: t = ""
                     if t and "SCAN" in t.upper():
                         log(f"OCR lang={lang} eng={eng} OK len={len(t)}")
-                        log("OCR:" + t[:1000])
+                        log("OCR:" + t[:1500])
                         return t
                     if t and t.strip():
                         log(f"OCR lang={lang} eng={eng} no SCAN, try next: {t[:200]}")
@@ -203,6 +203,7 @@ def is_sgl(t):
         return False, f"舖頭得 {len(found)} 間 ({found})，少過 3 間，已 Skip"
     return False, f"分數唔夠 score={score}，已 Skip"
 
+# ===== FIX: 逐行讀，唔好再用 Token 數格仔 =====
 def parse(t):
     txt = t.replace("\r", "\n")
     ds = (now_hk() - timedelta(days=1)).strftime("%d-%m-%Y")
@@ -216,45 +217,102 @@ def parse(t):
             ds = cand.strftime("%d-%m-%Y")
         except:
             pass
+    # --- 總箱數：處理 101 讀做 10 / 嘅情況 ---
     total = 0
-    m2 = re.search(r"總箱數[^0-9]{0,10}(\d{1,3})", txt)
-    if not m2:
-        m2 = re.search(r"總數[^0-9]{0,10}(\d{1,3})", txt)
-    if not m2:
-        m2 = re.search(r"TOTAL[^0-9]{0,10}(\d{1,3})", txt.upper())
-    if m2:
-        total = int(m2.group(1))
+    total_raw = ""
+    for line in txt.split("\n"):
+        if "總箱數" in line or "總數" in line or "TOTAL" in line.upper():
+            total_raw = line
+            break
+    if total_raw:
+        # 例如 "總箱數： 10 /" -> 10 後面有 /，即係個 1 俾人讀做 /，還原做 101
+        m_slash = re.search(r"(\d{1,2})\s*/", total_raw)
+        if m_slash:
+            total = int(m_slash.group(1) + "1")
+        else:
+            m2 = re.search(r"(\d{1,3})", total_raw)
+            if m2:
+                total = int(m2.group(1))
+    if not total:
+        m2 = re.search(r"總箱數[^0-9]{0,10}(\d{1,3})", txt)
+        if m2:
+            total = int(m2.group(1))
+    # --- 舖頭：逐行讀，每行最尾嗰個數字先係箱數 ---
     boxes = {s: 0 for s in SHOPS}
-    tokens = re.findall(r"[A-Z0-9]+", txt.upper())
-    log("parse tokens=" + str(tokens[:80]))
-    norm_map = {"TSTH":"TSTN","TSTW":"TSTN","M0K0":"MOKO"}
-    tokens = [norm_map.get(x, x) for x in tokens]
-    for i, tok in enumerate(tokens):
-        if tok in SHOPS:
-            for j in range(i + 1, min(i + 4, len(tokens))):
-                nt = tokens[j]
-                if nt.isdigit():
-                    v = int(nt)
-                    if 0 < v <= 100 and boxes[tok] == 0:
-                        boxes[tok] = v
-                    break
-                if nt in SHOPS:
-                    break
+    lines = txt.split("\n")
+    # 長 Code 要先認，唔好俾 TST 食咗 TSTN / TSTG，ATRA 食咗 AT1
+    shops_sorted = sorted(SHOPS, key=lambda x: -len(x))
+    for idx, line in enumerate(lines):
+        u = line.upper()
+        # 跳過總數行、標題行
+        if "總箱數" in line or "總數" in line or "SHOP CODE" in u:
+            continue
+        found_shop = None
+        for s in shops_sorted:
+            # 要成個 Code 出現，唔好俾 K11 呢啲干擾
+            # 用 \b，AT1 唔會誤認 ATRA，TST 唔會誤認 TSTN
+            if re.search(r"\b" + re.escape(s) + r"\b", u):
+                found_shop = s
+                break
+            # OCR 有時會將 TSTN 讀做 TSTH / TSTW，做少少容錯
+            if s == "TSTN" and re.search(r"\bTST[HN W]\b", u):
+                found_shop = s
+                break
+        if not found_shop:
+            continue
+        # 呢行入面嘅數字，最尾嗰個先係箱數
+        # 例如 "TST 尖沙咀 K11 10" -> 數字有 11, 10，最尾 10 先係箱數
+        # 例如 "AT1 機場 (T1) 9" -> 數字有 1, 9，最尾 9 先係箱數
+        # 例如 "TSTG 尖沙咀 (金馬倫) 14" -> 數字得 14，就係箱數
+        nums = re.findall(r"\d{1,2}", line)
+        if not nums:
+            continue
+        # 如果行入面有 K11 / T1 / T2 呢啲，頭幾個數字係舖頭名，唔係箱數，要 Skip 咗佢哋
+        # 策略：拎最尾嗰個數字，但如果最尾數字係 11 / 1 / 2 呢啲疑似舖頭名，就再睇埋下一行
+        v = int(nums[-1])
+        # 特殊情況：呢行得一個數字，又係 1 / 2 / 11，極可能係舖頭名，唔係箱數
+        if len(nums) == 1 and v in [1, 2, 11]:
+            continue
+        if 0 < v <= 100 and boxes[found_shop] == 0:
+            boxes[found_shop] = v
+    # --- Fallback：如果逐行讀到嘅總數太細，可能係 OCR 將數字推咗去下一行，用舊 Token 法補底 ---
     s = sum(boxes.values())
+    if s < 30:
+        tokens = re.findall(r"[A-Z0-9]+", txt.upper())
+        tokens = [{"TSTH":"TSTN","TSTW":"TSTN","M0K0":"MOKO"}.get(x, x) for x in tokens]
+        for i, tok in enumerate(tokens):
+            if tok in SHOPS and boxes[tok] == 0:
+                for j in range(i+1, min(i+6, len(tokens))):
+                    nt = tokens[j]
+                    if nt in ["K11", "T1", "T2"]:
+                        continue
+                    if nt.isdigit():
+                        v = int(nt)
+                        if 0 < v <= 100:
+                            boxes[tok] = v
+                        break
+                    if nt in SHOPS:
+                        break
+        s = sum(boxes.values())
+    # --- 總數修正：手寫 101 讀做 10 / 10 嘅情況 ---
+    # 如果總數係 10，但舖頭加埋係 90-110，就信舖頭加埋嗰個
     if total == 10 and 90 <= s <= 110:
         total = s
+    # 如果總數係 10 / 已經還原做 101，但舖頭加埋仲係細（因為有啲行 OCR 漏咗數字），
+    # 唔好將總數改細，留返 101 俾人手對，唔好 Skip
     if not total:
         total = s
     out = {"date": ds, "total": total, "boxes": boxes, "raw": t}
-    log("parse result date=" + ds + " total=" + str(total) + " boxes=" + str(boxes))
+    log("parse line-based date=" + ds + " total=" + str(total) + " boxes=" + str(boxes) + " total_raw=" + total_raw)
     return out
 
 def validate_sgl_parse(p):
     s = sum(p["boxes"].values())
     if s == 0:
         return False, "所有舖頭都係 0 箱, 已 Skip"
+    # FIX: 唔再因為對唔返就 Skip，照 PASS 但彈警告，唔好冇咗張單
     if p["total"] and abs(p["total"] - s) > 15:
-        return False, f"總箱數 {p['total']} 同舖頭加埋 {s} 差超過 15, 可能 OCR 讀錯, 已 Skip, 請人手對"
+        return True, f"⚠️ 警告：總箱數 {p['total']} 同舖頭加埋 {s} 差超過 15，OCR 可能漏咗幾行數字，照 PASS 但請人手對一次。已讀到嘅舖頭：{ {k:v for k,v in p['boxes'].items() if v} }"
     return True, "PASS"
 
 def yellow(ws, ri, cols):
@@ -391,29 +449,25 @@ async def webhook(request: Request):
                 return {"ok": True}
             _seen_msg_ids.add(mid)
             if len(_seen_msg_ids) > 500: _seen_msg_ids.clear()
-        # ===== FIX LID: 唔再靠電話號碼對 MY_WHATSAPP =====
-        # 舊版：MY_WHATSAPP (852...) in jid (8050...@lid) -> 永遠對唔上 -> Skip
-        # 新版：只要唔係 Group (@g.us)，就當係 DM，@lid 同 @s.whatsapp.net 都係 DM
         is_dm = ("@g.us" not in str(jid))
         if is_dm:
             img = dl_img({"key": key, "message": inner if inner != msg else msg})
             if not img:
-                # DM 嗰陣要 Send 返去邊個？jid 本身就係 sender，唔好用 MY_WHATSAPP 電話號碼
-                # 因為 Evolution 而家用 LID，Send 去 LID 先收到
                 send_text(jid, "背後測試：收唔到張相，下載失敗。")
                 return {"ok": True}
             t = ocr(img)
             ok, reason = is_sgl(t)
             if not ok:
-                send_text(jid, "\n原因：" + reason + "\n\nOCR 讀到：\n" + t[:800])
+                send_text(jid, "【背後測試 - 唔係 SGL，已 Skip，冇寫入】\n原因：" + reason + "\n\nOCR 讀到：\n" + t[:1200])
                 return {"ok": True}
             p = parse(t)
             ok2, reason2 = validate_sgl_parse(p)
             if not ok2:
-                send_text(jid, "\n原因：" + reason2 + "\n\nOCR 讀到：\n" + t[:800])
+                send_text(jid, "【背後測試 - 係 SGL 但總數對唔返，已 Skip，冇寫入】\n原因：" + reason2 + "\n\nOCR 讀到：\n" + t[:1200])
                 return {"ok": True}
             fee = sum([scan_cost_for(s, v) for s, v in p["boxes"].items() if v])
-            txt_lines = [""]
+            txt_lines = ["【背後測試 - 係 SGL，已 Skip，冇寫入】"]
+            txt_lines.append(reason2)
             txt_lines.append("日期：" + p["date"] + " 總箱數：" + str(p["total"]) + " 通行：$" + str(fee))
             for s in SHOPS:
                 if p["boxes"].get(s, 0): txt_lines.append(s + " " + str(p["boxes"][s]))
