@@ -18,12 +18,12 @@ INSTANCE = "my WhatsApps"
 BOT_URL = "https://cookie-delivery-bot-production.up.railway.app"
 GCP_JSON = os.getenv("GCP_JSON", "")
 MY_WHATSAPP = os.getenv("MY_WHATSAPP", "")
-# ===== V48 FIX: 預設 Group 改做真 VIP Group，同 tms.py 對齊 =====
-# 記得 Railway Env 入面嘅 TMS_GROUP_ID 都要改做呢個，唔係 Env 會蓋咗呢度
-TMS_GROUP_ID = os.getenv("TMS_GROUP_ID", "") or "120363410834827562@g.us"
+# ===== 用 Evolution API，唔係 Ultramsg，Ultramsg 過期都唔影響 =====
+# VIP Group = 運輸（VIP單）Group by 2CM = 120363413020795341@g.us
+# 記得 Railway Env 入面嘅 TMS_GROUP_ID 都要改做呢個
+TMS_GROUP_ID = os.getenv("TMS_GROUP_ID", "") or "120363413020795341@g.us"
 COOKIE_GROUP_ID = os.getenv("COOKIE_GROUP_ID", "") or "85264352282-1512209129@g.us"
 TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "") or "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35HmBNNVE"
-# OCR 已刪除，曲奇相唔再留、唔再回覆
 HKT = timezone(timedelta(hours=8))
 def now_hk():
     return datetime.now(HKT)
@@ -252,9 +252,7 @@ def parse_created(s):
         return None
     except: return None
 
-# ===== V48: check_jobs 改咗，唔再認錯 JobID，仲識得分新單 / 狀態變 / 改內容 =====
 def _row_hash(row_dict):
-    # 只睇會影響司機送貨嘅欄，CreatedAt / PodTime 嗰啲變咗唔當係修改，唔會亂出通知
     keys = ["Client","Zone","From","From_Contact","From_Phone","PickupTime","To","To_Contact","To_Phone","DeliveryTime","CargoDetail","Date","InternalNo","Driver","Status","Notes"]
     s = "|".join([str(row_dict.get(k, "")).strip() for k in keys])
     return hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()
@@ -266,7 +264,6 @@ def check_jobs():
         vals = ws.get_all_values()
         if len(vals) < 2: return
         headers = [h.strip() for h in vals[0]]
-        # FIX: 優先用 JobID，唔好再用 InternalNo 嚟認單，同 tms.py 對齊
         if "JobID" in headers:
             id_idx = headers.index("JobID")
         else:
@@ -279,7 +276,6 @@ def check_jobs():
         for r in vals[1:]:
             if not r or len(r) <= id_idx or not r[id_idx].strip(): continue
             jid = r[id_idx].strip()
-            # JobID 一定係 JOB- 開頭，如果呢行嘅 ID 唔係 JOB-，即係搵錯欄，跳過，唔好亂 send
             if not jid.upper().startswith("JOB-"):
                 continue
             row_dict = {}
@@ -289,10 +285,8 @@ def check_jobs():
             line = " | ".join([x for x in r if x.strip()])
             cur_hash = _row_hash(row_dict)
             if jid not in jobs_snapshot:
-                # 第一次開機，唔好將成個 Sheet 幾百張舊單當新單咁 send 晒出嚟
                 if is_first:
                     jobs_snapshot[jid] = {"status": st, "hash": cur_hash}
-                    # 第一次開機，只 send 15 分鐘內新開嘅單，舊單唔 send
                     if st.strip().upper() in ["DELIVERED","COMPLETED","CANCELLED","CANCEL"]:
                         continue
                     ca = parse_created(row_dict.get("CreatedAt_HKT","")) if ca_idx is not None else None
@@ -301,13 +295,9 @@ def check_jobs():
                     send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
                 else:
                     jobs_snapshot[jid] = {"status": st, "hash": cur_hash}
-                    # tms.py 開新單嗰陣已經 send 咗一次，呢度唔再 send，避免重複
-                    # 只有當 tms.py 冇 send 到（例如直接喺 Sheet 開單）先至由呢度補 send
-                    # 為咗唔重複，呢度新單唔 send，等 tms.py 嗰邊 send
                     log("check_jobs 新單已記低，唔重複 send: " + jid)
             else:
                 prev = jobs_snapshot[jid]
-                # 兼容舊版 snapshot 格式（舊版只係存咗個 Status string）
                 prev_status = prev.get("status") if isinstance(prev, dict) else prev
                 prev_hash = prev.get("hash") if isinstance(prev, dict) else None
                 if prev_hash == cur_hash and prev_status == st:
@@ -315,14 +305,8 @@ def check_jobs():
                 jobs_snapshot[jid] = {"status": st, "hash": cur_hash}
                 if is_first:
                     continue
-                # Status 變咗 = 搶單 / 送到 / 取消
                 if prev_status != st:
                     send_text(TMS_GROUP_ID, "TMS 狀態變更\n" + line)
-                # Status 冇變，但內容變咗 = office 喺 tms.py 改咗單
-                # tms.py 改完嗰陣已經 send 咗一次「Order 已修改」，呢度再 send 會重複
-                # 所以呢度只係更新 snapshot，唔再 send，等 tms.py 嗰邊 send 就夠
-                # 如果你係直接喺 Google Sheet 改，tms.py 唔會 send，咁呢度就要補 send：
-                # 我哋用 Notes 入面有冇「[修改」嚟分：有，即係 tms.py 已經 send 咗，唔再 send；冇，即係直接喺 Sheet 改，呢度補 send
                 elif prev_hash is not None and prev_hash != cur_hash:
                     notes = str(row_dict.get("Notes", "") or "")
                     if "[修改" in notes:
